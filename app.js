@@ -50,7 +50,7 @@ let lyrics = null;           // [{t, text}] | {plain}
 let curLyricLine = -1;
 let playlists = LS.get("playlists", []);
 let activeTab = "library";
-let backArmed = false, backTimer = null, appEntered = false;
+let appEntered = false;
 
 const audio = $("#audio");
 
@@ -597,22 +597,17 @@ function bind() {
     }
   });
 
-  // 안드로이드 '이전' 버튼:
-  //  · 전체 재생화면이 열려 있으면 → 그것만 닫고 앱 유지(재생 지속)
-  //  · 메인 화면에서 → 1번은 "한 번 더 누르면 종료" 안내, 2초 내 2번째에 앱 종료
+  // 안드로이드 '이전' 버튼: 앱을 닫지 않는다(음악 유지 우선).
+  //  · 전체 재생화면 열림 → 그것만 닫고 라이브러리로
+  //  · 어느 경우든 히스토리 트랩을 다시 세워 '이전'으로 앱이 종료되지 않게 함
+  //  → 완전히 끄려면 홈(백그라운드 재생 유지) 또는 '최근 앱'에서 밀기.
   window.addEventListener("popstate", () => {
-    if (!$("#player").hidden) {
-      closePlayerUI();
-      if (!(history.state && history.state.taGuard)) pushGuard();  // 트랩 유지
-      return;
+    if (!$("#player").hidden) { closePlayerUI(); pushGuard(); return; }
+    if (!LS.get("back_hint", false)) {   // 메인에서 첫 '이전' 때 한 번만 안내
+      toast("홈 버튼으로 나가면 음악이 계속 재생됩니다");
+      LS.set("back_hint", true);
     }
-    if (!backArmed) {
-      backArmed = true;
-      toast("한 번 더 누르면 종료합니다");
-      clearTimeout(backTimer);
-      // 2초 내 다시 '이전' → 트랩이 없는 상태라 브라우저가 앱을 종료. 아니면 다시 트랩.
-      backTimer = setTimeout(() => { backArmed = false; if ($("#player").hidden) pushGuard(); }, 2000);
-    }
+    pushGuard();
   });
 
   // 전체 재생 화면
