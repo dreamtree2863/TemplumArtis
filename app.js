@@ -376,6 +376,15 @@ function togglePlay() {
   if (curIndex < 0 && library.length) return playByLibIndex(0);
   if (audio.paused) audio.play(); else audio.pause();
 }
+// 완전 정지(미디어 알림을 밀어 없앨 때 호출됨) — 재생 멈추고 잠금화면 세션 제거.
+function stopPlayback() {
+  audio.pause();
+  try { audio.currentTime = 0; } catch (_) {}
+  if ("mediaSession" in navigator) {
+    navigator.mediaSession.playbackState = "none";
+    try { navigator.mediaSession.metadata = null; } catch (_) {}
+  }
+}
 
 /* 미디어세션(잠금화면/알림/헤드셋 컨트롤) — 앱을 나가도(백그라운드/잠금) OS가
    재생을 이어가고 컨트롤을 띄우게 한다. */
@@ -394,7 +403,7 @@ function updateMediaSession(title, artist, album, cover) {
   set("pause", () => audio.pause());
   set("previoustrack", prevTrack);
   set("nexttrack", () => nextTrack(false));
-  set("stop", () => audio.pause());
+  set("stop", stopPlayback);   // 미디어 알림을 밀어 없애면 재생 중단
   set("seekbackward", (d) => { audio.currentTime = Math.max(0, audio.currentTime - (d.seekOffset || 10)); });
   set("seekforward", (d) => { audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + (d.seekOffset || 10)); });
   set("seekto", (d) => { if (d.seekTime != null && audio.duration) audio.currentTime = d.seekTime; });
@@ -558,6 +567,13 @@ function bind() {
   $("#mini").addEventListener("click", (e) => { if (!e.target.closest(".mini-btn")) openPlayer(); });
   $("#mini-play").addEventListener("click", (e) => { e.stopPropagation(); togglePlay(); });
   $("#mini-next").addEventListener("click", (e) => { e.stopPropagation(); nextTrack(false); });
+
+  // 미디어 알림을 탭하면 앱이 포그라운드로 온다 → 재생 중이면 전체 재생화면을 편다.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && curIndex >= 0 && !audio.paused && $("#player").hidden) {
+      openPlayer();
+    }
+  });
 
   // 전체 재생 화면
   $("#player-close").addEventListener("click", closePlayer);
