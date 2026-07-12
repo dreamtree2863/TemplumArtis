@@ -25,8 +25,9 @@ img{display:block}
 .auth-sub{color:var(--dark-muted);margin:0 0 26px;font-size:14px}
 .auth-field{text-align:left;margin-bottom:18px}
 .auth-field label{display:block;font-size:12px;color:var(--dark-muted);margin-bottom:6px}
-.auth-field input{width:100%;padding:13px 14px;border-radius:12px;border:1px solid #3a3128;
-  background:#2b2419;color:var(--dark-ink);font-size:15px}
+.auth-field input,.auth-field textarea{width:100%;padding:13px 14px;border-radius:12px;
+  border:1px solid #3a3128;background:#2b2419;color:var(--dark-ink);font-size:15px;
+  font-family:inherit;resize:vertical}
 .auth-field small{display:block;color:#8c8172;font-size:11px;margin-top:6px}
 .btn-primary{width:100%;padding:15px;border-radius:12px;background:var(--accent);
   color:#fff;font-size:16px;font-weight:700}

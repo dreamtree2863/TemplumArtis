@@ -109,29 +109,60 @@ async function driveFetch(url, asBlob) {
   if (!r.ok) throw new Error("Drive " + r.status);
   return asBlob ? r.arrayBuffer() : r.json();
 }
-async function listAllAudio(onProgress) {
-  const qExt = AUDIO_EXTS.map((e) => `name contains '${e}'`).join(" or ");
-  const q = encodeURIComponent(`(mimeType contains 'audio/' or ${qExt}) and trashed=false`);
-  const out = [];
-  let pageToken = "";
-  do {
-    const url = `https://www.googleapis.com/drive/v3/files?q=${q}` +
-      `&fields=nextPageToken,files(id,name,size,mimeType)&pageSize=1000&orderBy=name` +
-      `&spaces=drive&supportsAllDrives=true&includeItemsFromAllDrives=true` +
-      (pageToken ? `&pageToken=${pageToken}` : "");
+function escQ(s) { return String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'"); }
+function isAudioFile(f) {
+  if ((f.mimeType || "").startsWith("audio/")) return true;
+  return AUDIO_EXTS.some((e) => f.name.toLowerCase().endsWith(e));
+}
+function toTrack(f) {
+  const stem = f.name.replace(/\.[^.]+$/, "");
+  const dash = stem.indexOf(" - ");
+  return { id: f.id, name: f.name, size: +f.size || 0,
+    title: dash > 0 ? stem.slice(0, dash) : stem,
+    artist: dash > 0 ? stem.slice(dash + 3) : "" };
+}
+// 저장된 음악 폴더 경로 목록(My Drive 기준). 기본은 데스크톱 라이브러리 폴더.
+function getFolderPaths() {
+  const v = LS.get("folder_paths", null);
+  return (Array.isArray(v) && v.length) ? v : ["Junho's Data/취미/음악"];
+}
+function setFolderPaths(arr) { LS.set("folder_paths", arr); }
+
+// "A/B/C" 경로를 폴더 ID로 변환(My Drive 루트부터). 못 찾으면 null.
+async function resolveFolderPath(path) {
+  let parent = "root";
+  for (const seg of path.split("/").map((s) => s.trim()).filter(Boolean)) {
+    const q = encodeURIComponent(
+      `name='${escQ(seg)}' and '${parent}' in parents and ` +
+      `mimeType='application/vnd.google-apps.folder' and trashed=false`);
+    const url = `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&pageSize=2&spaces=drive`;
     const data = await driveFetch(url, false);
-    for (const f of data.files || []) {
-      const stem = f.name.replace(/\.[^.]+$/, "");
-      const dash = stem.indexOf(" - ");
-      out.push({
-        id: f.id, name: f.name, size: +f.size || 0,
-        title: dash > 0 ? stem.slice(0, dash) : stem,
-        artist: dash > 0 ? stem.slice(dash + 3) : "",
-      });
-    }
-    pageToken = data.nextPageToken || "";
-    onProgress && onProgress(out.length);
-  } while (pageToken);
+    if (!data.files || !data.files.length) return null;
+    parent = data.files[0].id;
+  }
+  return parent;
+}
+// 지정 폴더들의 오디오 파일만 하위 폴더까지 재귀로 수집(드라이브 전체 아님).
+async function listFolderAudio(rootIds, onProgress) {
+  const out = [], seen = new Set(), queue = [...rootIds];
+  while (queue.length) {
+    const parent = queue.shift();
+    let pageToken = "";
+    do {
+      const q = encodeURIComponent(`'${parent}' in parents and trashed=false`);
+      const url = `https://www.googleapis.com/drive/v3/files?q=${q}` +
+        `&fields=nextPageToken,files(id,name,size,mimeType)&pageSize=1000&orderBy=name&spaces=drive` +
+        (pageToken ? `&pageToken=${pageToken}` : "");
+      const data = await driveFetch(url, false);
+      for (const f of data.files || []) {
+        if (f.mimeType === "application/vnd.google-apps.folder") { queue.push(f.id); continue; }
+        if (isAudioFile(f) && !seen.has(f.id)) { seen.add(f.id); out.push(toTrack(f)); }
+      }
+      pageToken = data.nextPageToken || "";
+      onProgress && onProgress(out.length);
+    } while (pageToken);
+  }
+  out.sort((a, b) => a.title.localeCompare(b.title, "ko"));
   return out;
 }
 
@@ -399,17 +430,38 @@ async function loadLibrary(forceRefresh) {
     status.textContent = `${library.length}곡 (캐시) · ⟳ 로 새로고침`;
     return;
   }
-  status.textContent = "Drive에서 목록 불러오는 중…";
+  const paths = getFolderPaths();
+  status.textContent = "음악 폴더 찾는 중…";
   $("#track-list").innerHTML = `<div class="spinner"></div>`;
   try {
-    library = await listAllAudio((n) => (status.textContent = `불러오는 중… ${n}곡`));
+    const rootIds = [], missing = [];
+    for (const p of paths) {
+      const id = await resolveFolderPath(p);
+      if (id) rootIds.push(id); else missing.push(p);
+    }
+    if (!rootIds.length) {
+      status.textContent = "";
+      $("#track-list").innerHTML = `<li class="entries-empty">음악 폴더를 찾지 못했습니다:<br>${
+        paths.map(escapeHtml).join("<br>")}<br><br>상단 📁 로 경로를 확인/수정하세요.<br>(My Drive 기준, 예: Junho's Data/취미/음악)</li>`;
+      return;
+    }
+    library = await listFolderAudio(rootIds, (n) => (status.textContent = `불러오는 중… ${n}곡`));
     LS.set("lib_cache", library);
     applySearch();
-    status.textContent = `${library.length}곡`;
+    status.textContent = `${library.length}곡` + (missing.length ? ` · ⚠️ 못 찾은 폴더: ${missing.join(", ")}` : "");
   } catch (e) {
     status.textContent = "";
     $("#track-list").innerHTML = `<li class="entries-empty">목록 로딩 실패: ${escapeHtml(e.message)}</li>`;
   }
+}
+// 음악 폴더 경로 편집(로그인 후 📁 버튼) → 다시 스캔.
+function editFolders() {
+  const ans = prompt("음악 폴더 경로 (My Drive 기준, 한 줄에 하나):", getFolderPaths().join("\n"));
+  if (ans == null) return;
+  const arr = ans.split("\n").map((s) => s.trim()).filter(Boolean);
+  if (!arr.length) return;
+  setFolderPaths(arr);
+  loadLibrary(true);
 }
 
 /* ───────────────────── 인증 흐름 ───────────────────── */
@@ -417,6 +469,8 @@ async function signIn() {
   const id = $("#client-id").value.trim();
   if (!id) return showAuthError("클라이언트 ID를 입력하세요.");
   CLIENT_ID = id; LS.set("client_id", id);
+  const fp = $("#folder-paths").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  if (fp.length) setFolderPaths(fp);
   try {
     if (!tokenClient) await initToken();
     await requestToken(true);
@@ -439,7 +493,9 @@ function signOut() {
 /* ───────────────────── 이벤트 바인딩 ───────────────────── */
 function bind() {
   $("#client-id").value = CLIENT_ID;
+  $("#folder-paths").value = getFolderPaths().join("\n");
   $("#btn-signin").addEventListener("click", signIn);
+  $("#btn-folders").addEventListener("click", editFolders);
   $("#btn-refresh").addEventListener("click", () => loadLibrary(true));
   $("#btn-signout").addEventListener("click", signOut);
   $("#search").addEventListener("input", applySearch);

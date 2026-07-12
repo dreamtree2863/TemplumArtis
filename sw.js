@@ -3,7 +3,7 @@
    · Drive 오디오(alt=media): <audio>가 직접 스트리밍. SW가 Authorization 헤더를
      주입하고 Range 요청을 그대로 전달(206) → 통째 다운로드 없이 즉시 재생/탐색.
    (스트리밍 인증 주입 기법은 Templum Sapientiae Mobile PWA에서 검증된 방식.) */
-const CACHE = "ta-music-v2";
+const CACHE = "ta-music-v3";
 const SHELL = [
   "./", "./index.html", "./style.css", "./app.js",
   "./manifest.webmanifest", "./icon.svg", "./icon-192.png", "./icon-512.png",
@@ -50,16 +50,13 @@ self.addEventListener("fetch", (e) => {
     return; // 그 외 alt=media(메타 range fetch 등)는 페이지가 직접 인증해 가져감
   }
 
-  // 앱 셸 — 캐시 우선, 없으면 네트워크(받으면 갱신).
+  // 앱 셸 — 네트워크 우선(항상 최신 코드), 오프라인이면 캐시로 폴백.
   if (req.method === "GET" && url.origin === self.location.origin) {
     e.respondWith(
-      caches.match(req).then((hit) =>
-        hit || fetch(req).then((res) => {
-          const copy = res.clone();
-          caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
-          return res;
-        }).catch(() => hit)
-      )
+      fetch(req).then((res) => {
+        if (res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {}); }
+        return res;
+      }).catch(() => caches.match(req))
     );
   }
   // 그 외(Drive 목록 API, OAuth 등)는 그냥 네트워크로 통과.
