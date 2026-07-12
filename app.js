@@ -284,6 +284,7 @@ async function playByLibIndex(i) {
   const track = library[i];
   $("#mini").hidden = false;
   setNowPlaying({ title: track.title, artist: track.artist, album: "", cover: null });
+  updateMediaSession(track.title, track.artist, "", null);   // 잠금화면에 즉시 표시(태그 전)
   $("#mini-play").textContent = "…"; $("#btn-play").textContent = "…";
   lyrics = null; curLyricLine = -1;
   renderList();
@@ -373,15 +374,36 @@ function togglePlay() {
   if (audio.paused) audio.play(); else audio.pause();
 }
 
-/* 미디어세션(잠금화면/헤드셋 컨트롤) */
+/* 미디어세션(잠금화면/알림/헤드셋 컨트롤) — 앱을 나가도(백그라운드/잠금) OS가
+   재생을 이어가고 컨트롤을 띄우게 한다. */
 function updateMediaSession(title, artist, album, cover) {
   if (!("mediaSession" in navigator)) return;
-  const artwork = cover ? [{ src: cover, sizes: "512x512", type: "image/jpeg" }] : [];
-  navigator.mediaSession.metadata = new MediaMetadata({ title, artist, album, artwork });
-  navigator.mediaSession.setActionHandler("play", () => audio.play());
-  navigator.mediaSession.setActionHandler("pause", () => audio.pause());
-  navigator.mediaSession.setActionHandler("previoustrack", prevTrack);
-  navigator.mediaSession.setActionHandler("nexttrack", () => nextTrack(false));
+  const artwork = cover
+    ? [96, 128, 192, 256, 384, 512].map((s) => ({ src: cover, sizes: `${s}x${s}`, type: "image/jpeg" }))
+    : [{ src: "./icon-512.png", sizes: "512x512", type: "image/png" }];
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: title || "", artist: artist || "", album: album || "", artwork,
+    });
+  } catch (_) {}
+  const set = (a, fn) => { try { navigator.mediaSession.setActionHandler(a, fn); } catch (_) {} };
+  set("play", () => audio.play());
+  set("pause", () => audio.pause());
+  set("previoustrack", prevTrack);
+  set("nexttrack", () => nextTrack(false));
+  set("stop", () => audio.pause());
+  set("seekbackward", (d) => { audio.currentTime = Math.max(0, audio.currentTime - (d.seekOffset || 10)); });
+  set("seekforward", (d) => { audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + (d.seekOffset || 10)); });
+  set("seekto", (d) => { if (d.seekTime != null && audio.duration) audio.currentTime = d.seekTime; });
+}
+// 잠금화면 진행바용 위치 상태(간헐 갱신). duration이 유효할 때만.
+function updatePositionState() {
+  const ms = navigator.mediaSession;
+  if (!ms || !ms.setPositionState) return;
+  const d = audio.duration;
+  if (!d || !isFinite(d)) return;
+  try { ms.setPositionState({ duration: d, playbackRate: audio.playbackRate || 1, position: Math.min(audio.currentTime, d) }); }
+  catch (_) {}
 }
 
 /* ───────────────────── 플레이리스트 ───────────────────── */
@@ -559,14 +581,24 @@ function bind() {
   seek.addEventListener("change", () => { if (audio.duration) audio.currentTime = (seek.value / 1000) * audio.duration; seeking = false; });
 
   // 오디오 이벤트
-  audio.addEventListener("play", () => { $("#mini-play").textContent = "❚❚"; $("#btn-play").textContent = "❚❚"; });
-  audio.addEventListener("pause", () => { $("#mini-play").textContent = "▶"; $("#btn-play").textContent = "▶"; });
+  audio.addEventListener("play", () => {
+    $("#mini-play").textContent = "❚❚"; $("#btn-play").textContent = "❚❚";
+    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
+    updatePositionState();
+  });
+  audio.addEventListener("pause", () => {
+    $("#mini-play").textContent = "▶"; $("#btn-play").textContent = "▶";
+    if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+  });
   audio.addEventListener("ended", () => nextTrack(true));
+  audio.addEventListener("loadedmetadata", updatePositionState);
+  let posTick = 0;
   audio.addEventListener("timeupdate", () => {
     const d = audio.duration || 0, c = audio.currentTime || 0;
     if (!seeking && d) { seek.value = Math.round((c / d) * 1000); $("#cur-time").textContent = fmtTime(c); }
     $("#dur-time").textContent = fmtTime(d);
     $("#mini-prog").firstElementChild.style.width = d ? (c / d * 100) + "%" : "0";
+    if (++posTick % 8 === 0) updatePositionState();   // 약 2초마다 잠금화면 진행바 갱신
     syncLyrics();
   });
 }
