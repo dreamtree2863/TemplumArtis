@@ -36,6 +36,11 @@ function toast(msg) {
 let CLIENT_ID = LS.get("client_id", "") || DEFAULT_CLIENT_ID;
 let tokenClient = null, accessToken = "", tokenExp = 0;
 let curCoverUrl = null;
+// 저장해 둔 액세스 토큰이 아직 유효하면 메모리로 복원(재진입 시 로그인 화면 생략).
+(function restoreToken() {
+  const t = LS.get("token", null);
+  if (t && t.t && t.exp > Date.now()) { accessToken = t.t; tokenExp = t.exp; }
+})();
 let library = [];            // [{id, name, title, artist, size}]
 let filtered = [];
 let curIndex = -1;
@@ -71,6 +76,7 @@ function requestToken(interactive) {
       accessToken = resp.access_token;
       tokenExp = Date.now() + (resp.expires_in - 60) * 1000;
       LS.set("signed_in", true);
+      LS.set("token", { t: accessToken, exp: tokenExp });   // 재진입 시 재사용(만료 전까지)
       sendTokenToSW();   // SW가 <audio> 스트리밍 요청에 인증을 주입할 수 있도록 전달
       resolve(accessToken);
     };
@@ -484,7 +490,7 @@ function enterApp() {
   loadLibrary(false);
 }
 function signOut() {
-  accessToken = ""; tokenExp = 0; LS.set("signed_in", false);
+  accessToken = ""; tokenExp = 0; LS.set("signed_in", false); LS.set("token", null);
   if (window.google?.accounts?.oauth2 && accessToken) google.accounts.oauth2.revoke(accessToken);
   audio.pause();
   location.reload();
@@ -576,10 +582,18 @@ async function main() {
       if (swReloaded) return; swReloaded = true; location.reload();
     });
   }
-  // 이전에 로그인했고 클라이언트 ID가 있으면 조용히 재로그인 시도
+  // 이전에 로그인한 적이 있으면 로그인 화면 없이 진입 시도.
   if (CLIENT_ID && LS.get("signed_in", false)) {
+    // 1) 저장된 토큰이 아직 유효 → 즉시 진입(네트워크·구글 세션 불필요).
+    if (accessToken && Date.now() < tokenExp) {
+      sendTokenToSW();
+      enterApp();
+      initToken().catch(() => {});   // 나중 토큰 갱신에 대비해 백그라운드 준비
+      return;
+    }
+    // 2) 만료됐으면 구글 세션으로 조용히 재발급(비번·동의창 없음).
     try { await initToken(); await requestToken(false); enterApp(); return; }
-    catch { /* 조용히 실패 → 로그인 화면 */ }
+    catch { /* 조용히 실패 → 로그인 화면(원탭) */ }
   }
 }
 main();
