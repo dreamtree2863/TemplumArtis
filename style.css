@@ -44,6 +44,7 @@ img{display:block}
   background:var(--panel);border-bottom:1px solid var(--line)}
 .appbar-title{display:flex;align-items:center;gap:8px;flex:1;font-size:17px}
 .appbar-title img{width:24px;height:24px;border-radius:7px}
+.ver{font-size:11px;color:var(--faint);font-weight:600}
 .icon-btn{width:40px;height:40px;border-radius:11px;font-size:19px;color:var(--muted);
   display:grid;place-items:center}
 .icon-btn:active{background:var(--accent-soft)}

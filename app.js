@@ -4,6 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
+const APP_VERSION = "v6";   // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const LS = {
@@ -554,6 +555,7 @@ function signOut() {
 
 /* ───────────────────── 이벤트 바인딩 ───────────────────── */
 function bind() {
+  $$(".ver").forEach((el) => (el.textContent = APP_VERSION));
   $("#client-id").value = CLIENT_ID;
   $("#folder-paths").value = getFolderPaths().join("\n");
   $("#btn-signin").addEventListener("click", signIn);

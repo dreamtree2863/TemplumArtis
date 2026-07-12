@@ -3,7 +3,7 @@
    · Drive 오디오(alt=media): <audio>가 직접 스트리밍. SW가 Authorization 헤더를
      주입하고 Range 요청을 그대로 전달(206) → 통째 다운로드 없이 즉시 재생/탐색.
    (스트리밍 인증 주입 기법은 Templum Sapientiae Mobile PWA에서 검증된 방식.) */
-const CACHE = "ta-music-v5";
+const CACHE = "ta-music-v6";
 const AUTH_CACHE = "ta-auth";   // Drive 토큰 보관(SW 재시작 후에도 읽기 위함)
 const SHELL = [
   "./", "./index.html", "./style.css", "./app.js",
