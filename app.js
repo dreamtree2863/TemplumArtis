@@ -568,7 +568,14 @@ function bind() {
 /* ───────────────────── 시작 ───────────────────── */
 async function main() {
   bind();
-  if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js").catch(() => {});
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("./sw.js").then((reg) => { try { reg.update(); } catch (_) {} }).catch(() => {});
+    // 새 서비스워커가 제어를 넘겨받으면(=코드 갱신) 자동으로 한 번만 새로고침.
+    let swReloaded = false;
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      if (swReloaded) return; swReloaded = true; location.reload();
+    });
+  }
   // 이전에 로그인했고 클라이언트 ID가 있으면 조용히 재로그인 시도
   if (CLIENT_ID && LS.get("signed_in", false)) {
     try { await initToken(); await requestToken(false); enterApp(); return; }
