@@ -50,6 +50,7 @@ let lyrics = null;           // [{t, text}] | {plain}
 let curLyricLine = -1;
 let playlists = LS.get("playlists", []);
 let activeTab = "library";
+let backArmed = false, backTimer = null, appEntered = false;
 
 const audio = $("#audio");
 
@@ -451,8 +452,28 @@ function playPlaylist(id) {
 }
 
 /* ───────────────────── 화면 전환 ───────────────────── */
-function openPlayer() { const p = $("#player"); p.hidden = false; requestAnimationFrame(() => p.classList.add("up")); }
-function closePlayer() { const p = $("#player"); p.classList.remove("up"); setTimeout(() => (p.hidden = true), 340); }
+function openPlayer() {
+  const p = $("#player");
+  if (!p.hidden) return;
+  // 히스토리 상태를 하나 쌓아, 안드로이드 '이전' 버튼이 앱을 나가는 대신
+  // 이 상태를 되돌리며(popstate) 재생화면만 닫게 한다 → 앱 유지 → 재생 지속.
+  try { history.pushState({ taPlayer: 1 }, ""); } catch (_) {}
+  p.hidden = false;
+  requestAnimationFrame(() => p.classList.add("up"));
+}
+function closePlayerUI() {
+  const p = $("#player");
+  if (p.hidden) return;
+  p.classList.remove("up");
+  setTimeout(() => (p.hidden = true), 340);
+}
+function closePlayer() {
+  // ▾ 닫기 버튼: 히스토리를 되돌려 popstate 경로로 닫음(상태 일관 유지).
+  if (history.state && history.state.taPlayer) history.back();
+  else closePlayerUI();
+}
+// 메인 화면에서 '이전'을 눌러도 바로 앱이 꺼지지 않도록 히스토리에 트랩을 하나 쌓는다.
+function pushGuard() { try { history.pushState({ taGuard: 1 }, ""); } catch (_) {} }
 function activePPanel() { return $(".ptab.active")?.dataset.ptab; }
 function switchTab(tab) {
   activeTab = tab;
@@ -521,6 +542,7 @@ function showAuthError(msg) { const el = $("#auth-error"); el.textContent = msg;
 function enterApp() {
   $("#screen-auth").hidden = true;
   $("#screen-main").hidden = false;
+  if (!appEntered) { appEntered = true; pushGuard(); }  // '이전' 버튼 트랩 시작
   loadLibrary(false);
 }
 function signOut() {
@@ -572,6 +594,24 @@ function bind() {
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible" && curIndex >= 0 && !audio.paused && $("#player").hidden) {
       openPlayer();
+    }
+  });
+
+  // 안드로이드 '이전' 버튼:
+  //  · 전체 재생화면이 열려 있으면 → 그것만 닫고 앱 유지(재생 지속)
+  //  · 메인 화면에서 → 1번은 "한 번 더 누르면 종료" 안내, 2초 내 2번째에 앱 종료
+  window.addEventListener("popstate", () => {
+    if (!$("#player").hidden) {
+      closePlayerUI();
+      if (!(history.state && history.state.taGuard)) pushGuard();  // 트랩 유지
+      return;
+    }
+    if (!backArmed) {
+      backArmed = true;
+      toast("한 번 더 누르면 종료합니다");
+      clearTimeout(backTimer);
+      // 2초 내 다시 '이전' → 트랩이 없는 상태라 브라우저가 앱을 종료. 아니면 다시 트랩.
+      backTimer = setTimeout(() => { backArmed = false; if ($("#player").hidden) pushGuard(); }, 2000);
     }
   });
 
