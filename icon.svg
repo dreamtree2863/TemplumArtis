@@ -1,0 +1,16 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <rect width="64" height="64" rx="15" fill="#c0644a"/>
+  <g fill="#ffffff">
+    <!-- pediment (삼각 지붕) -->
+    <path d="M32 12 L52 25 L12 25 Z"/>
+    <!-- architrave (상인방) -->
+    <rect x="13" y="27" width="38" height="4" rx="1"/>
+    <!-- columns (기둥) -->
+    <rect x="16" y="33" width="4.6" height="16" rx="0.8"/>
+    <rect x="24.7" y="33" width="4.6" height="16" rx="0.8"/>
+    <rect x="34.7" y="33" width="4.6" height="16" rx="0.8"/>
+    <rect x="43.4" y="33" width="4.6" height="16" rx="0.8"/>
+    <!-- base (기단) -->
+    <rect x="12" y="50" width="40" height="4.5" rx="1"/>
+  </g>
+</svg>

@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+  <meta name="theme-color" content="#1b1712">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="TA Music">
+  <link rel="apple-touch-icon" href="./apple-touch-icon.png">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./style.css">
+  <title>Templum Artis Music</title>
+</head>
+<body>
+
+<!-- ─────────── 로그인/설정 화면 ─────────── -->
+<section id="screen-auth" class="screen auth">
+  <div class="auth-card">
+    <img class="auth-logo" src="./icon.svg" alt="">
+    <h1>Templum Artis <span>Music</span></h1>
+    <p class="auth-sub">내 Google Drive 음악을 싱크 가사와 함께.</p>
+
+    <div class="auth-field">
+      <label>Google OAuth 클라이언트 ID</label>
+      <input id="client-id" type="text" inputmode="text" autocomplete="off"
+             placeholder="xxxxxxxx.apps.googleusercontent.com">
+      <small>최초 1회만. 설정 방법은 아래 도움말 참고.</small>
+    </div>
+
+    <button id="btn-signin" class="btn-primary">Google 계정으로 로그인</button>
+    <p id="auth-error" class="auth-error" hidden></p>
+
+    <details class="auth-help">
+      <summary>OAuth 클라이언트 ID 만드는 법</summary>
+      <ol>
+        <li>console.cloud.google.com → 프로젝트 생성</li>
+        <li>"API 및 서비스" → 라이브러리 → <b>Google Drive API</b> 사용 설정</li>
+        <li>"OAuth 동의 화면" 구성(외부, 테스트 사용자에 본인 계정 추가)</li>
+        <li>"사용자 인증 정보" → OAuth 클라이언트 ID → <b>웹 애플리케이션</b></li>
+        <li>승인된 자바스크립트 원본에 이 페이지 주소(예: https://아이디.github.io) 추가</li>
+        <li>생성된 클라이언트 ID를 위에 붙여넣기</li>
+      </ol>
+    </details>
+  </div>
+</section>
+
+<!-- ─────────── 메인(라이브러리/플레이리스트) ─────────── -->
+<section id="screen-main" class="screen main" hidden>
+  <header class="appbar">
+    <div class="appbar-title"><img src="./icon.svg" alt=""> <b>TA Music</b></div>
+    <button id="btn-refresh" class="icon-btn" title="새로고침">⟳</button>
+    <button id="btn-signout" class="icon-btn" title="로그아웃">⎋</button>
+  </header>
+
+  <!-- 라이브러리 탭 -->
+  <div class="tabview" data-view="library">
+    <div class="searchbar">
+      <input id="search" type="search" placeholder="곡·아티스트·앨범 검색" autocomplete="off">
+    </div>
+    <div id="lib-status" class="lib-status"></div>
+    <ul id="track-list" class="track-list"></ul>
+  </div>
+
+  <!-- 플레이리스트 탭 -->
+  <div class="tabview" data-view="playlists" hidden>
+    <div class="pl-head">
+      <h2>플레이리스트</h2>
+      <button id="btn-pl-new" class="btn-mini">+ 새로</button>
+    </div>
+    <div id="pl-list" class="pl-list"></div>
+  </div>
+
+  <!-- 미니 플레이어 -->
+  <div id="mini" class="mini" hidden>
+    <img id="mini-art" class="mini-art" alt="">
+    <div class="mini-meta">
+      <div id="mini-title" class="mini-title">—</div>
+      <div id="mini-artist" class="mini-artist"></div>
+    </div>
+    <button id="mini-play" class="mini-btn">▶</button>
+    <button id="mini-next" class="mini-btn">⏭</button>
+    <div id="mini-prog" class="mini-prog"><span></span></div>
+  </div>
+
+  <!-- 하단 탭 -->
+  <nav class="tabbar">
+    <button class="tab active" data-tab="library"><span>♪</span>곡</button>
+    <button class="tab" data-tab="playlists"><span>≡</span>목록</button>
+  </nav>
+</section>
+
+<!-- ─────────── 전체 재생 화면(슬라이드업) ─────────── -->
+<section id="player" class="player" hidden>
+  <header class="player-top">
+    <button id="player-close" class="icon-btn">▾</button>
+    <div class="player-tabs">
+      <button class="ptab active" data-ptab="cover">앨범</button>
+      <button class="ptab" data-ptab="lyrics">가사</button>
+    </div>
+    <button id="player-add" class="icon-btn" title="플레이리스트에 담기">＋</button>
+  </header>
+
+  <div class="ppanel" data-ppanel="cover">
+    <div class="cover-wrap"><img id="cover" class="cover" alt=""></div>
+    <div class="np-meta">
+      <div id="np-title" class="np-title">—</div>
+      <div id="np-artist" class="np-artist"></div>
+      <div id="np-album" class="np-album"></div>
+    </div>
+  </div>
+
+  <div class="ppanel" data-ppanel="lyrics" hidden>
+    <div id="lyrics" class="lyrics"><div class="ly-empty">가사를 불러오는 중…</div></div>
+  </div>
+
+  <div class="controls">
+    <div class="seekrow">
+      <span id="cur-time">0:00</span>
+      <input id="seek" type="range" min="0" max="1000" value="0">
+      <span id="dur-time">0:00</span>
+    </div>
+    <div class="btnrow">
+      <button id="btn-shuffle" class="ctl">🔀</button>
+      <button id="btn-prev" class="ctl">⏮</button>
+      <button id="btn-play" class="ctl ctl-main">▶</button>
+      <button id="btn-next" class="ctl">⏭</button>
+      <button id="btn-repeat" class="ctl">🔁</button>
+    </div>
+  </div>
+</section>
+
+<audio id="audio" preload="auto"></audio>
+<div id="toast" class="toast" hidden></div>
+
+<!-- Google Identity Services (OAuth 토큰 클라이언트) -->
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="./app.js"></script>
+</body>
+</html>
