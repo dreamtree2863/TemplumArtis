@@ -3,7 +3,8 @@
    · Drive 오디오(alt=media): <audio>가 직접 스트리밍. SW가 Authorization 헤더를
      주입하고 Range 요청을 그대로 전달(206) → 통째 다운로드 없이 즉시 재생/탐색.
    (스트리밍 인증 주입 기법은 Templum Sapientiae Mobile PWA에서 검증된 방식.) */
-const CACHE = "ta-music-v3";
+const CACHE = "ta-music-v4";
+const AUTH_CACHE = "ta-auth";   // Drive 토큰 보관(SW 재시작 후에도 읽기 위함)
 const SHELL = [
   "./", "./index.html", "./style.css", "./app.js",
   "./manifest.webmanifest", "./icon.svg", "./icon-192.png", "./icon-512.png",
@@ -17,22 +18,36 @@ self.addEventListener("install", (e) => {
 });
 self.addEventListener("activate", (e) => {
   e.waitUntil(
-    caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
-      .then(() => self.clients.claim())
+    caches.keys().then((keys) => Promise.all(
+      keys.filter((k) => k !== CACHE && k !== AUTH_CACHE).map((k) => caches.delete(k))
+    )).then(() => self.clients.claim())
   );
 });
 self.addEventListener("message", (e) => {
   const d = e.data;
   if (d === "skipWaiting") return self.skipWaiting();
-  if (d && d.type === "token" && d.token) swToken = d.token;
+  if (d && d.type === "token" && d.token) {
+    swToken = d.token;
+    caches.open(AUTH_CACHE).then((c) => c.put("token", new Response(d.token))).catch(() => {});
+  }
 });
 
-// 인증 헤더가 없으면(=<audio>의 직접요청) 보관 토큰으로 채워 새 Request 생성.
+// 메모리 토큰이 없으면(백그라운드에서 SW가 종료됐다 재시작된 경우) 캐시에서 복원.
+async function getToken() {
+  if (swToken) return swToken;
+  try {
+    const c = await caches.open(AUTH_CACHE);
+    const r = await c.match("token");
+    if (r) swToken = await r.text();
+  } catch (_) {}
+  return swToken;
+}
+// 인증 헤더가 없으면(=<audio>의 직접요청) 토큰으로 채워 새 Request 생성.
 // Range 등 원래 헤더는 그대로 복사 → 스트리밍/탐색 유지.
-function withAuth(req) {
-  if (req.headers.has("Authorization") || !swToken) return req;
+function authReq(req, tok) {
+  if (req.headers.has("Authorization") || !tok) return req;
   const h = new Headers(req.headers);
-  h.set("Authorization", "Bearer " + swToken);
+  h.set("Authorization", "Bearer " + tok);
   return new Request(req.url, { method: req.method, headers: h, mode: "cors", credentials: "omit", redirect: "follow" });
 }
 
@@ -45,7 +60,10 @@ self.addEventListener("fetch", (e) => {
       && url.pathname.startsWith("/drive/v3/files/")
       && url.searchParams.get("alt") === "media") {
     if (req.destination === "audio" || req.destination === "video" || req.headers.has("range")) {
-      e.respondWith(fetch(withAuth(req), { cache: "no-store" }).catch(() => new Response("", { status: 504 })));
+      e.respondWith(
+        getToken().then((tok) => fetch(authReq(req, tok), { cache: "no-store" }))
+          .catch(() => new Response("", { status: 504 }))
+      );
     }
     return; // 그 외 alt=media(메타 range fetch 등)는 페이지가 직접 인증해 가져감
   }

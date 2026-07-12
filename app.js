@@ -91,6 +91,9 @@ async function ensureToken() {
 // 요청할 때 SW가 Authorization 헤더를 넣어준다.
 function sendTokenToSW() {
   if (!("serviceWorker" in navigator) || !accessToken) return;
+  // 1) 캐시에 저장 → 백그라운드에서 SW가 종료·재시작돼도 인증 토큰을 읽을 수 있음.
+  if (window.caches) caches.open("ta-auth").then((c) => c.put("token", new Response(accessToken))).catch(() => {});
+  // 2) 실행 중인 SW에 즉시 전달.
   navigator.serviceWorker.ready.then((reg) => {
     (navigator.serviceWorker.controller || reg.active)?.postMessage({ type: "token", token: accessToken });
   }).catch(() => {});
