@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v25";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v26";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -610,7 +610,9 @@ function startPlayback(url, crossfade) {
   if (canCross) {
     const outgoing = audio, incoming = spare;
     try { incoming.volume = 0; } catch (_) {}
-    incoming.src = url;
+    // spare에 이 곡을 미리 버퍼링해 뒀으면(preloadNext) src를 다시 설정하지 않는다.
+    // 다시 넣으면 버퍼가 버려져 미리 받은 의미가 사라진다.
+    if (incoming.src !== url) incoming.src = url;
     try { incoming.currentTime = 0; } catch (_) {}
     audio = incoming; spare = outgoing;   // 새 요소를 '활성'으로 → 이벤트가 새 곡에 귀속
     incoming.play().catch(() => {});
@@ -625,14 +627,55 @@ function startPlayback(url, crossfade) {
         outgoing.pause();
         try { outgoing.currentTime = 0; outgoing.volume = 1; } catch (_) {}
         outgoing.removeAttribute("src"); try { outgoing.load(); } catch (_) {}
+        schedulePreloadNext();   // 이제 spare가 비었으니 다음 곡을 미리 버퍼
       }
     }, FADE_STEP_MS);
   } else {
-    try { spare.pause(); spare.removeAttribute("src"); } catch (_) {}
+    try { spare.pause(); if (spare.src !== url) spare.removeAttribute("src"); } catch (_) {}
     try { audio.volume = 1; } catch (_) {}
-    audio.src = url;
+    if (audio.src !== url) audio.src = url;
     audio.play().catch(() => {});
+    schedulePreloadNext();
   }
+}
+
+// ── 다음 곡 미리 버퍼링(순차 재생일 때만) ──────────────────────────────
+// 재생 중 곡을 넘기거나 자동으로 다음 곡으로 갈 때, 그때부터 스트림을 새로 열면
+// Drive 첫 바이트 지연이 보인다. 다음 곡을 대기(spare) 요소에 미리 올려 브라우저가
+// 앞부분을 버퍼링해 두면, 넘길 때 곧바로 소리가 난다. 셔플·마지막 곡(반복 아님)이면
+// 예측이 안 되거나 다음이 없어 건너뛴다. 데이터는 다음 1곡분만 더 쓴다.
+function peekNextIndex() {
+  if (shuffle) return -1;
+  if (plQueue && plQueue.length) {
+    let p = plQueuePos + 1;
+    if (p >= plQueue.length) { if (repeat !== "all") return -1; p = 0; }
+    return plQueue[p];
+  }
+  if (!library.length) return -1;
+  let n = curIndex + 1;
+  if (n >= library.length) { if (repeat !== "all") return -1; n = 0; }
+  return n;
+}
+let preloadTimer = null;
+function schedulePreloadNext() {
+  clearTimeout(preloadTimer);
+  // 현재 곡의 초반 버퍼링과 대역폭 경쟁을 피해 잠깐 뒤에 시작한다.
+  preloadTimer = setTimeout(preloadNext, 2500);
+}
+function preloadNext() {
+  if (fadeTimer || audio.paused) return;        // 페이드 중(spare 사용 중)·정지 중엔 안 함
+  const ni = peekNextIndex();
+  if (ni < 0) return;
+  const t = library[ni];
+  if (!t || !t.id) return;
+  const url = driveUrl(t.id);
+  if (spare.src === url) return;                 // 이미 이 곡을 물려둠
+  try {
+    spare.pause();
+    spare.preload = "auto";
+    spare.src = url;                             // 브라우저가 앞부분을 미리 버퍼(재생 안 함)
+  } catch (_) {}
+  prefetchCover(t);                              // 다음 곡 커버도 미리(공유 파일)
 }
 
 /* ───────────────────── 공간감/울림 효과 (Web Audio) ─────────────────────
