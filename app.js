@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v9";   // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v10";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -78,6 +78,24 @@ let advancing = false;       // 곡 끝 무렵 다음 곡으로 미리 넘어가
 let enriching = false, enrichStop = false;
 let seeking = false, posTick = 0;
 const LYRIC_LEAD_MS = 400;   // 가사를 살짝 앞당겨 표시(데스크톱과 동일한 체감)
+
+/* ───────────────────── 앱 설치(홈 화면 추가) ─────────────────────
+   자동 설치 배너는 브라우저가 자주 생략하고 iOS엔 아예 없다. 직접 누를 수 있는
+   설치 버튼을 띄운다. Android는 네이티브 프롬프트, iOS는 수동 안내. */
+let deferredPrompt = null;
+function isStandalone() {
+  return window.matchMedia && window.matchMedia("(display-mode: standalone)").matches
+    || window.navigator.standalone === true;   // iOS 홈 화면 실행 여부
+}
+function isIOS() { return /iphone|ipad|ipod/i.test(navigator.userAgent); }
+function showInstallFab() { const b = $("#install-fab"); if (b && !isStandalone()) b.hidden = false; }
+function hideInstallFab() { const b = $("#install-fab"); if (b) b.hidden = true; }
+window.addEventListener("beforeinstallprompt", (e) => {
+  e.preventDefault();       // 브라우저 기본 배너 대신 우리 버튼을 쓴다
+  deferredPrompt = e;
+  showInstallFab();
+});
+window.addEventListener("appinstalled", () => { deferredPrompt = null; hideInstallFab(); toast("설치되었습니다"); });
 
 /* ───────────────────── OAuth (GIS) ───────────────────── */
 function waitForGIS() {
@@ -858,6 +876,17 @@ function bind() {
   $("#client-id").value = CLIENT_ID;
   $("#folder-paths").value = getFolderPaths().join("\n");
   $("#btn-signin").addEventListener("click", signIn);
+  $("#install-fab").addEventListener("click", async () => {
+    if (deferredPrompt) {
+      deferredPrompt.prompt();
+      try { await deferredPrompt.userChoice; } catch (_) {}
+      deferredPrompt = null; hideInstallFab();
+      return;
+    }
+    // 네이티브 프롬프트가 없는 경우(iOS 등) → 수동 안내
+    if (isIOS()) alert("Safari 하단의 공유 버튼(□↑)을 누른 뒤 '홈 화면에 추가'를 선택하세요.");
+    else alert("브라우저 메뉴(⋮)에서 '앱 설치' 또는 '홈 화면에 추가'를 누르세요.");
+  });
   $("#btn-folders").addEventListener("click", editFolders);
   $("#btn-refresh").addEventListener("click", () => loadLibrary(true));
   $("#btn-signout").addEventListener("click", signOut);
@@ -1002,6 +1031,9 @@ function bindAudioEvents(el) {
 /* ───────────────────── 시작 ───────────────────── */
 async function main() {
   bind();
+  // iOS Safari는 beforeinstallprompt가 없다. 설치 전(브라우저 실행)이면 버튼을 띄워
+  // 수동 안내로라도 설치를 돕는다. 이미 설치돼 실행 중이면 숨긴다.
+  if (!isStandalone() && isIOS()) showInstallFab();
   if ("serviceWorker" in navigator) {
     // updateViaCache:"none" — sw.js를 HTTP 캐시 없이 항상 새로 받아 갱신을 확인한다.
     // (GitHub Pages의 max-age=600 때문에 안 그러면 최대 10분간 옛 SW가 유지됨)
