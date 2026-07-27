@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v8";   // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v9";   // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -1003,7 +1003,10 @@ function bindAudioEvents(el) {
 async function main() {
   bind();
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("./sw.js").then((reg) => { try { reg.update(); } catch (_) {} }).catch(() => {});
+    // updateViaCache:"none" — sw.js를 HTTP 캐시 없이 항상 새로 받아 갱신을 확인한다.
+    // (GitHub Pages의 max-age=600 때문에 안 그러면 최대 10분간 옛 SW가 유지됨)
+    navigator.serviceWorker.register("./sw.js", { updateViaCache: "none" })
+      .then((reg) => { try { reg.update(); } catch (_) {} }).catch(() => {});
     // 새 서비스워커가 제어를 넘겨받으면(=코드 갱신) 자동으로 한 번만 새로고침.
     let swReloaded = false;
     navigator.serviceWorker.addEventListener("controllerchange", () => {

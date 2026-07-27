@@ -3,7 +3,7 @@
    · Drive 오디오(alt=media): <audio>가 직접 스트리밍. SW가 Authorization 헤더를
      주입하고 Range 요청을 그대로 전달(206) → 통째 다운로드 없이 즉시 재생/탐색.
    (스트리밍 인증 주입 기법은 Templum Sapientiae Mobile PWA에서 검증된 방식.) */
-const CACHE = "ta-music-v8";
+const CACHE = "ta-music-v9";
 const AUTH_CACHE = "ta-auth";   // Drive 토큰 보관(SW 재시작 후에도 읽기 위함)
 const SHELL = [
   "./", "./index.html", "./style.css", "./app.js",
@@ -69,9 +69,11 @@ self.addEventListener("fetch", (e) => {
   }
 
   // 앱 셸 — 네트워크 우선(항상 최신 코드), 오프라인이면 캐시로 폴백.
+  // cache:"no-store"로 브라우저 HTTP 캐시를 건너뛴다. GitHub Pages가 max-age=600(10분)을
+  // 걸어, 그냥 fetch하면 코드를 바꿔도 최대 10분간 옛 파일이 나온다(=v버전 안 바뀜).
   if (req.method === "GET" && url.origin === self.location.origin) {
     e.respondWith(
-      fetch(req).then((res) => {
+      fetch(req, { cache: "no-store" }).then((res) => {
         if (res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {}); }
         return res;
       }).catch(() => caches.match(req))
