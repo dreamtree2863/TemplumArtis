@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v26";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v27";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -1330,17 +1330,51 @@ function addCurrentToPlaylist() {
   if (curIndex < 0) return toast("재생 중인 곡이 없습니다.");
   addTrackToPlaylist(library[curIndex]);
 }
-// 임의의 트랙을 담기: 대상 플레이리스트를 고르거나 새로 만든다(prompt).
+// 임의의 트랙을 담기: 번호 입력 대신 플레이리스트 목록을 바텀시트로 띄워 터치로 고른다.
+let chooseTrack = null;
 function addTrackToPlaylist(track) {
   if (!track) return;
-  const names = playlists.map((p, i) => `${i + 1}. ${p.name}`).join("\n");
-  const ans = prompt(`담을 플레이리스트 번호 (또는 새 이름 입력):\n${names || "(없음)"}`, "");
-  if (ans == null) return;
-  let pl = playlists[+ans - 1];
-  if (!pl) { pl = { id: Date.now().toString(36), name: ans.trim() || "새 목록", rel: [], ts: Date.now() }; playlists.push(pl); }
-  const added = addRelToPlaylist(pl, track.rel);
+  chooseTrack = track;
+  renderChooserList();
+  const s = $("#pl-choose");
+  s.hidden = false;
+  requestAnimationFrame(() => s.classList.add("open"));
+  try { history.pushState({ taChoose: 1 }, ""); } catch (_) {}
+}
+function renderChooserList() {
+  const box = $("#pl-choose-list");
+  if (!playlists.length) {
+    box.innerHTML = `<div class="sheet-empty">플레이리스트가 없습니다.<br>아래에서 새로 만들어 담아보세요.</div>`;
+    return;
+  }
+  box.innerHTML = playlists.map((p) => {
+    const has = chooseTrack && p.rel.includes(chooseTrack.rel);
+    return `<button class="sheet-row${has ? " has" : ""}" data-plchoose="${p.id}">
+        <span class="sheet-row-name">${escapeHtml(p.name)}</span>
+        <span class="sheet-row-cnt">${p.rel.length}곡${has ? " · 담김 ✓" : ""}</span>
+      </button>`;
+  }).join("");
+}
+function closePlaylistChooser() {
+  const s = $("#pl-choose");
+  s.classList.remove("open");
+  setTimeout(() => { s.hidden = true; }, 200);
+  chooseTrack = null;
+}
+function chooseAddToPlaylist(plId) {
+  const pl = playlists.find((p) => p.id === plId);
+  if (!pl || !chooseTrack) return;
+  const added = addRelToPlaylist(pl, chooseTrack.rel);
   renderPlaylists();
   toast(added ? `'${pl.name}'에 담았어요.` : `이미 '${pl.name}'에 있어요.`);
+  if (history.state && history.state.taChoose) history.back(); else closePlaylistChooser();
+}
+function chooseNewPlaylist() {
+  const name = prompt("새 플레이리스트 이름");
+  if (name == null) return;
+  const pl = { id: Date.now().toString(36), name: name.trim() || "새 목록", rel: [], ts: Date.now() };
+  playlists.push(pl);
+  chooseAddToPlaylist(pl.id);
 }
 
 /* ── 재생 큐(플레이리스트를 순서대로) ── */
@@ -1685,8 +1719,10 @@ function enterApp() {
 let wakeLock = null;
 async function acquireWakeLock() {
   try {
+    if (wakeLock) return;   // 이미 보유 중이면 중복 요청 안 함
     if ("wakeLock" in navigator && document.visibilityState === "visible") {
       wakeLock = await navigator.wakeLock.request("screen");
+      // 시스템이 락을 놓으면(예: 잠깐 화면 꺼짐) 다시 잡을 수 있게 상태만 비운다.
       wakeLock.addEventListener("release", () => { wakeLock = null; });
     }
   } catch (_) { wakeLock = null; }
@@ -1784,6 +1820,16 @@ function bind() {
   });
   // '곡 추가' 피커
   $("#plp-close").addEventListener("click", () => { if (history.state && history.state.taPicker) history.back(); else closeAddPicker(); });
+
+  // 플레이리스트 담기 바텀시트
+  $("#pl-choose-list").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-plchoose]");
+    if (b) chooseAddToPlaylist(b.dataset.plchoose);
+  });
+  $("#pl-choose-new").addEventListener("click", chooseNewPlaylist);
+  const closeChoose = () => { if (history.state && history.state.taChoose) history.back(); else closePlaylistChooser(); };
+  $("#pl-choose-close").addEventListener("click", closeChoose);
+  $("#pl-choose .sheet-backdrop").addEventListener("click", closeChoose);
   let pickerSearchT = null;
   $("#plp-search").addEventListener("input", (e) => {
     clearTimeout(pickerSearchT);
@@ -1831,6 +1877,7 @@ function bind() {
   //  · 어느 경우든 히스토리 트랩을 다시 세워 '이전'으로 앱이 종료되지 않게 함
   //  → 완전히 끄려면 홈(백그라운드 재생 유지) 또는 '최근 앱'에서 밀기.
   window.addEventListener("popstate", () => {
+    if (!$("#pl-choose").hidden) { closePlaylistChooser(); pushGuard(); return; }   // 담기 시트 먼저 닫기
     if (!$("#pl-picker").hidden) { closeAddPicker(); pushGuard(); return; }   // 피커 먼저 닫기
     if (!$("#player").hidden) { closePlayerUI(); pushGuard(); return; }
     if (selectedPlaylistId && activeTab === "playlists") { selectedPlaylistId = null; renderPlaylists(); pushGuard(); return; }
@@ -1888,6 +1935,7 @@ function bindAudioEvents(el) {
     $("#mini-play").textContent = "❚❚"; $("#btn-play").textContent = "❚❚";
     if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
     updatePositionState();
+    acquireWakeLock();   // 재생 시작(사용자 제스처)마다 화면 꺼짐 방지 락 재확보
   });
   el.addEventListener("pause", function () {
     if (this !== audio) return;
