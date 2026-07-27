@@ -97,10 +97,12 @@ img{display:block}
 .album-artist{font-size:11.5px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
 /* 플레이리스트 */
-.pl-head{display:flex;align-items:center;justify-content:space-between;padding:14px 18px 6px}
-.pl-head h2{margin:0;font-size:18px}
+.pl-head{display:flex;align-items:center;gap:8px;padding:14px 18px 6px}
+.pl-head h2{margin:0 auto 0 0;font-size:18px}
 .btn-mini{padding:7px 12px;border-radius:10px;background:var(--accent-soft);color:var(--accent-dark);font-weight:700;font-size:13px}
+.btn-mini.spinning,.pld-icon.spinning{animation:spin .8s linear infinite}
 .pl-list{overflow-y:auto;flex:1;padding:6px 12px 150px}
+.pl-list.detail{padding-top:0}
 .pl-item{display:flex;align-items:center;gap:12px;padding:14px;background:var(--panel);
   border:1px solid var(--line);border-radius:14px;margin-bottom:10px}
 .pl-item-body{flex:1;min-width:0}
@@ -115,7 +117,10 @@ img{display:block}
 .pl-cover{position:relative;width:100%;height:100%;object-fit:cover;transition:opacity .2s}
 .pl-cover:not(.has-art){opacity:0}
 /* 플레이리스트 상세 */
-.pld-head{display:flex;align-items:center;gap:8px;padding:10px 6px 12px;position:sticky;top:0;background:var(--bg);z-index:2}
+/* 상세 헤더: 스크롤 컨테이너의 좌우 패딩(12px)을 음수 마진으로 상쇄해 배경이 폭 전체를
+   덮게 하고(스크롤되는 곡 행이 옆으로 새 보이지 않음), top:0로 앱바 바로 아래에 고정. */
+.pld-head{display:flex;align-items:center;gap:8px;margin:0 -12px;padding:12px 18px;
+  position:sticky;top:0;background:var(--bg);z-index:2;border-bottom:1px solid var(--line)}
 .pld-back{width:36px;height:36px;flex:none;font-size:24px;color:var(--ink)}
 .pld-name{flex:1;min-width:0;font-weight:800;font-size:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pld-cnt{font-weight:500;font-size:12.5px;color:var(--muted)}

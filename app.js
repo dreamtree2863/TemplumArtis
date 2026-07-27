@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v17";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v18";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -978,6 +978,29 @@ async function syncPlaylists() {
   if (activeTab === "playlists") renderPlaylists();
 }
 
+// 새로고침 버튼: 공용 파일(_playlists.json)만 다시 읽어 PC 변경을 즉시 반영.
+// 라이브러리는 다시 안 읽으므로 빠르다(rel 매핑은 이미 있음).
+let plRefreshing = false;
+async function refreshPlaylists() {
+  if (plRefreshing) return;
+  plRefreshing = true;
+  document.querySelectorAll("#btn-pl-refresh, #pl-refresh-btn").forEach((b) => b.classList.add("spinning"));
+  try {
+    const before = JSON.stringify(plItems());
+    const merged = mergeItems(plItems(), await readSharedItems(), Date.now());
+    plFromItems(merged);
+    LS.set("pl_items", plItems());
+    await writeSharedItems(plItems());   // 양쪽 수렴(폰 로컬 변경도 함께 반영)
+    if (activeTab === "playlists") renderPlaylists();
+    toast(JSON.stringify(plItems()) === before ? "이미 최신입니다." : "PC 변경 내용을 불러왔어요.");
+  } catch (_) {
+    toast("불러오지 못했습니다. 네트워크를 확인하세요.");
+  } finally {
+    plRefreshing = false;
+    document.querySelectorAll("#btn-pl-refresh, #pl-refresh-btn").forEach((b) => b.classList.remove("spinning"));
+  }
+}
+
 function savePlaylists() {
   LS.set("pl_items", plItems());
   // 공용 저장은 약간 미뤄 묶는다. 저장 전 공용과 병합해 다른 기기 변경을 지키지 않도록.
@@ -1026,8 +1049,9 @@ function plCoverUrl(pl, cb) {
 function renderPlaylists() {
   const box = $("#pl-list");
   const head = $(".pl-head");
-  if (selectedPlaylistId) { if (head) head.hidden = true; return renderPlaylistDetail(box); }
+  if (selectedPlaylistId) { if (head) head.hidden = true; box.classList.add("detail"); return renderPlaylistDetail(box); }
   if (head) head.hidden = false;
+  box.classList.remove("detail");
   if (!playlists.length) { box.innerHTML = `<div class="pl-empty">플레이리스트가 없습니다.<br>+새로 만들어 곡을 담아보세요.</div>`; return; }
   box.innerHTML = playlists.map((p) => `
     <div class="pl-item" data-plopen="${p.id}">
@@ -1048,9 +1072,10 @@ function renderPlaylistDetail(box) {
   if (!pl) { selectedPlaylistId = null; return renderPlaylists(); }
   const rows = pl.rel.map((rel, i) => {
     const t = trackByRel(rel);
+    if (t && !t.enriched) queueEnrich(t);   // 태그 미확인 곡은 우선 읽어 실제 제목/아티스트로 갱신
     const title = t ? t.title : (rel.split("/").pop() || rel);
     const artist = t ? (t.artist || "알 수 없는 아티스트") : "라이브러리에 없음";
-    return `<div class="pld-track${t ? "" : " missing"}" data-pos="${i}">
+    return `<div class="pld-track${t ? "" : " missing"}" data-pos="${i}"${t ? ` data-id="${t.id}"` : ""}>
         <div class="track-body">
           <div class="track-title">${escapeHtml(title)}</div>
           <div class="track-artist">${escapeHtml(artist)}</div>
@@ -1062,6 +1087,7 @@ function renderPlaylistDetail(box) {
     <div class="pld-head">
       <button class="pld-back" id="pl-back">‹</button>
       <div class="pld-name">${escapeHtml(pl.name)} <span class="pld-cnt">${pl.rel.length}곡</span></div>
+      <button class="pld-icon" id="pl-refresh-btn" title="PC 변경 내용 불러오기">⟳</button>
       <button class="pld-icon" id="pl-cover-btn" title="커버 사진 설정">🖼</button>
       <button class="pld-icon" id="pl-del-btn" title="플레이리스트 삭제">🗑</button>
       <button class="pld-add" id="pl-add-btn">＋ 곡</button>
@@ -1297,12 +1323,15 @@ function enrichAllBg() {
 }
 // 이미 화면에 있는 행이면 값만 제자리 갱신(다시 그리지 않아 스크롤·깜빡임 없음).
 function updateRowInPlace(t) {
-  const row = $(`#track-list .track[data-id="${t.id}"]`);
-  if (!row) return;
-  const ti = row.querySelector(".track-title");
-  const ar = row.querySelector(".track-artist");
-  if (ti) ti.textContent = t.title || "";
-  if (ar) ar.textContent = t.artist || "알 수 없는 아티스트";
+  // 라이브러리 목록 + (열려 있으면) 플레이리스트 상세 — 같은 곡의 모든 행을 갱신.
+  const rows = document.querySelectorAll(
+    `#track-list .track[data-id="${t.id}"], #pl-list .pld-track[data-id="${t.id}"]`);
+  rows.forEach((row) => {
+    const ti = row.querySelector(".track-title");
+    const ar = row.querySelector(".track-artist");
+    if (ti) ti.textContent = t.title || "";
+    if (ar) ar.textContent = t.artist || "알 수 없는 아티스트";
+  });
 }
 // 앨범/연도/장르는 파일 태그에만 있어, 재생하지 않은 곡은 비어 있다. 원할 때
 // 곡마다 태그 앞부분(커버 제외, ~96KB)만 받아 채운다. 결과는 영구 캐시.
@@ -1504,12 +1533,14 @@ function bind() {
     playlists.push({ id: Date.now().toString(36), name: name.trim(), rel: [], ts: Date.now() });
     savePlaylists(); renderPlaylists();
   });
+  $("#btn-pl-refresh").addEventListener("click", refreshPlaylists);
   $("#pl-list").addEventListener("click", (e) => {
     const play = e.target.closest("[data-plplay]");
     if (play) { e.stopPropagation(); playPlaylist(play.dataset.plplay); openPlayer(); return; }
     const open = e.target.closest("[data-plopen]");
     if (open) { selectedPlaylistId = open.dataset.plopen; renderPlaylists(); return; }
     if (e.target.closest("#pl-back")) { selectedPlaylistId = null; renderPlaylists(); return; }
+    if (e.target.closest("#pl-refresh-btn")) { refreshPlaylists(); return; }
     if (e.target.closest("#pl-add-btn")) { openAddPicker(); return; }
     if (e.target.closest("#pl-cover-btn")) { pendingCoverPl = selectedPlaylistId; $("#pl-cover-file").click(); return; }
     if (e.target.closest("#pl-del-btn")) { deleteSelectedPlaylist(); return; }
