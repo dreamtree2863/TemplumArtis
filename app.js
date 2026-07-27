@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v22";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v23";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -227,6 +227,22 @@ async function driveThumbBytes(t, px) {
   } catch (_) { return null; }
 }
 
+// ── 커버 로딩 자가 진단(임시): 첫 몇 개 커버가 Drive 썸네일로 받아지는지 화면에 보고 ──
+let coverDiag = { thumb: 0, thumbBytes: 0, embed: 0, done: 0, reported: false };
+function coverDiagNote(kind, bytes) {
+  if (coverDiag.reported) return;
+  if (kind === "thumb") { coverDiag.thumb++; coverDiag.thumbBytes += bytes || 0; }
+  else { coverDiag.embed++; }
+  if (++coverDiag.done < 5) return;
+  coverDiag.reported = true;
+  const avg = coverDiag.thumb ? Math.round(coverDiag.thumbBytes / coverDiag.thumb / 1024) : 0;
+  const msg = coverDiag.thumb
+    ? `커버: Drive 썸네일 ${coverDiag.thumb}/${coverDiag.done} · 평균 ${avg}KB ✓`
+    : `커버: Drive 썸네일 미작동 → 임베디드 폴백 중`;
+  console.log("[coverDiag]", msg, coverDiag);
+  toast(msg);
+}
+
 // 한 곡 커버를 백그라운드로 미리 받아 캐시. 먼저 Drive 서버 썸네일(작고 빠름),
 // 없거나 실패하면 곡 파일의 임베디드 커버로 폴백.
 async function prefetchCover(t) {
@@ -235,11 +251,11 @@ async function prefetchCover(t) {
     const c = await caches.open(COVER_CACHE);
     if (await c.match(coverKey(t))) return;   // 이미 캐시됨
     const thumb = await driveThumbBytes(t, COVER_THUMB_PX);
-    if (thumb) { putCachedCover(t, thumb.data, thumb.mime); return; }
+    if (thumb) { putCachedCover(t, thumb.data, thumb.mime); coverDiagNote("thumb", thumb.data.length); return; }
     const buf = await fetchTagExact(t.id);     // 폴백: 임베디드 커버
     if (!buf) return;
     const m = parseID3(buf);
-    if (m && m.cover) putCachedCover(t, m.cover.data, m.cover.mime);
+    if (m && m.cover) { putCachedCover(t, m.cover.data, m.cover.mime); coverDiagNote("embed"); }
   } catch (_) {}
 }
 // 현재 곡 다음 N곡의 커버를 순서대로 미리 받는다(스킵/자동재생 시 즉시 표시).
