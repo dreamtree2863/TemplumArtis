@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v27";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v28";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -688,6 +688,7 @@ function preloadNext() {
 // 그래프를 아예 만들지 않아 기존 재생 경로를 안 건드린다.
 let actx = null, spDry = null, spWet = null, spConv = null, spPre = null, spComp = null, spMakeup = null;
 let spaceReady = false, spaceApplied = false, normApplied = false;
+let curSpaceMode = "off";   // 현재 공간감 모드 — 일시정지 때 잔향을 껐다가 재생 때 되살리기 위함
 const spaceSources = new WeakMap();
 const SPACE_PRESETS = {
   off:  { dry: 1.0, wet: 0.0, pre: 0.0, ir: null },
@@ -744,6 +745,7 @@ function reflectSpaceUI(mode) {
 }
 function applySpace(mode, save) {
   if (!SPACE_PRESETS[mode]) mode = "off";
+  curSpaceMode = mode;
   if (save !== false) LS.set("space_fx", mode);
   reflectSpaceUI(mode);
   if (mode === "off") {
@@ -756,6 +758,16 @@ function applySpace(mode, save) {
   if (p.ir) spConv.buffer = makeIR(p.ir[0], p.ir[1]);
   spPre.delayTime.value = p.pre;
   spDry.gain.value = p.dry; spWet.gain.value = p.wet;
+}
+// 일시정지/정지 때 리버브(울림) 잔향을 즉시 끊는다. 안 그러면 소리를 멈춰도
+// 컨볼버 꼬리(~2초)가 계속 울린다. 재생을 다시 켜면 restoreReverb로 되살린다.
+function killReverbTail() {
+  if (spaceReady && spWet) { try { spWet.gain.value = 0; } catch (_) {} }
+}
+function restoreReverb() {
+  if (spaceReady && spWet && curSpaceMode !== "off" && SPACE_PRESETS[curSpaceMode]) {
+    try { spWet.gain.value = SPACE_PRESETS[curSpaceMode].wet; } catch (_) {}
+  }
 }
 // 음량 평준화: 완만한 컴프레션 + 메이크업 게인으로 곡 간 볼륨 차를 줄인다(PC normvol과 결 맞춤).
 function reflectNormUI(on) { const b = $("#fx-norm"); if (b) b.classList.toggle("active", !!on); }
@@ -1936,11 +1948,13 @@ function bindAudioEvents(el) {
     if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
     updatePositionState();
     acquireWakeLock();   // 재생 시작(사용자 제스처)마다 화면 꺼짐 방지 락 재확보
+    restoreReverb();     // 일시정지 때 껐던 울림을 되살림
   });
   el.addEventListener("pause", function () {
     if (this !== audio) return;
     $("#mini-play").textContent = "▶"; $("#btn-play").textContent = "▶";
     if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+    killReverbTail();    // 멈추면 울림 꼬리가 계속 울리지 않게 즉시 끊음
   });
   el.addEventListener("ended", function () { if (this === audio) nextTrack(true); });
   el.addEventListener("loadedmetadata", function () { if (this === audio) updatePositionState(); });
