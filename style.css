@@ -107,6 +107,28 @@ img{display:block}
 .pl-item-name{font-weight:700;font-size:15px}
 .pl-item-sub{font-size:12px;color:var(--muted);margin-top:2px}
 .pl-empty,.entries-empty{color:var(--muted);text-align:center;padding:40px 20px;font-size:14px}
+.pl-item{cursor:pointer}
+.pl-play-btn{width:40px;height:40px;flex:none;color:var(--accent);font-size:18px;border-radius:50%}
+/* 플레이리스트 커버(커스텀 or 첫 곡 앨범커버, 없으면 ♪) */
+.pl-thumb{position:relative;width:52px;height:52px;border-radius:10px;overflow:hidden;flex:none;background:var(--accent-soft)}
+.pl-thumb::before{content:"♪";position:absolute;inset:0;display:grid;place-items:center;color:var(--accent);font-size:22px}
+.pl-cover{position:relative;width:100%;height:100%;object-fit:cover;transition:opacity .2s}
+.pl-cover:not(.has-art){opacity:0}
+/* 플레이리스트 상세 */
+.pld-head{display:flex;align-items:center;gap:8px;padding:10px 6px 12px;position:sticky;top:0;background:var(--bg);z-index:2}
+.pld-back{width:36px;height:36px;flex:none;font-size:24px;color:var(--ink)}
+.pld-name{flex:1;min-width:0;font-weight:800;font-size:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pld-cnt{font-weight:500;font-size:12.5px;color:var(--muted)}
+.pld-icon{width:38px;height:38px;flex:none;font-size:17px}
+.pld-add{flex:none;padding:8px 12px;border-radius:10px;background:var(--accent);color:#fff;font-weight:700;font-size:13px}
+.pld-track{display:flex;align-items:center;gap:10px;padding:12px 6px;border-bottom:1px solid var(--line);cursor:pointer}
+.pld-track.missing{opacity:.45}
+.pld-track .track-title{font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pld-track .track-artist{font-size:12.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pld-remove{width:34px;height:34px;flex:none;color:var(--faint);font-size:20px}
+/* 곡 추가 피커(전체화면) */
+.picker{z-index:70;background:var(--bg)}
+.track-add.added{color:var(--accent)}
 
 /* ───── 미니 플레이어 ───── */
 .mini{position:absolute;left:8px;right:8px;bottom:calc(var(--safe-bot) + 58px);

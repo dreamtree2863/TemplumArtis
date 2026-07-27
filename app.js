@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v16";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v17";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -58,6 +58,11 @@ let lyrics = null;           // [{t, text}] | {plain}
 let curLyricLine = -1;
 let playlists = [];          // [{id, name, rel:[상대경로], ts}] — syncPlaylists에서 로드
 let plTombs = {};            // {id: ts} 삭제 기록(PC에도 전파)
+let selectedPlaylistId = null;   // 상세 뷰로 열어본 플레이리스트(null이면 목록)
+let plQueue = null;          // 재생 큐(플레이리스트 재생 시 라이브러리 인덱스 배열)
+let plQueuePos = -1;         // 큐 내 현재 위치
+let pendingCoverPl = null;   // 커버 사진 선택 중인 플레이리스트 id
+let pickerPlId = null;       // '곡 추가' 피커가 대상으로 하는 플레이리스트 id
 let activeTab = "library";
 let appEntered = false;
 let sortMode = LS.get("sort_mode", "title");   // title|artist|album|year|genre
@@ -760,8 +765,15 @@ function syncLyrics() {
   }
 }
 function nextTrack(auto) {
-  if (!library.length) return;
   if (repeat === "one" && auto) { audio.currentTime = 0; audio.play(); return; }
+  // 플레이리스트 재생 중이면 그 큐 안에서 다음 곡으로.
+  if (plQueue && plQueue.length) {
+    let p;
+    if (shuffle) { do { p = Math.floor(Math.random() * plQueue.length); } while (plQueue.length > 1 && p === plQueuePos); }
+    else { p = plQueuePos + 1; if (p >= plQueue.length) { if (repeat !== "all" && auto) return; p = 0; } }
+    plQueuePos = p; playByLibIndex(plQueue[p]); return;
+  }
+  if (!library.length) return;
   let n;
   if (shuffle) { do { n = Math.floor(Math.random() * library.length); } while (library.length > 1 && n === curIndex); }
   else { n = curIndex + 1; if (n >= library.length) { if (repeat !== "all" && auto) return; n = 0; } }
@@ -769,6 +781,10 @@ function nextTrack(auto) {
 }
 function prevTrack() {
   if (audio.currentTime > 3) { audio.currentTime = 0; return; }
+  if (plQueue && plQueue.length) {
+    let p = plQueuePos - 1; if (p < 0) p = plQueue.length - 1;
+    plQueuePos = p; playByLibIndex(plQueue[p]); return;
+  }
   let n = curIndex - 1; if (n < 0) n = library.length - 1;
   playByLibIndex(n);
 }
@@ -975,36 +991,213 @@ function savePlaylists() {
     } catch (_) {}
   }, 800);
 }
+/* ── 커버(커스텀=로컬 저장, 없으면 첫 곡 앨범커버) ── */
+function plCustomCovers() { return LS.get("pl_covers", {}); }
+function plGetCustomCover(id) { return plCustomCovers()[id] || null; }
+function plSetCustomCover(id, dataUrl) {
+  const m = plCustomCovers();
+  if (dataUrl) m[id] = dataUrl; else delete m[id];
+  LS.set("pl_covers", m);
+}
+function trackByRel(rel) { const id = relToId.get(rel); return id ? library.find((t) => t.id === id) : null; }
+// 썸네일 img에 url을 걸되, 로드 성공 시에만 보이게(깨진 아이콘 방지 → 뒤의 ♪가 보임).
+function setThumb(img, url) {
+  if (!img) return;
+  img.onload = img.onerror = null;
+  if (url) {
+    img.classList.remove("has-art");
+    img.onload = () => img.classList.add("has-art");
+    img.onerror = () => { img.removeAttribute("src"); img.classList.remove("has-art"); };
+    img.src = url;
+  } else { img.removeAttribute("src"); img.classList.remove("has-art"); }
+}
+// 플레이리스트 커버 URL을 콜백으로 전달: 커스텀 > 첫 곡 앨범커버 > null(=♪).
+function plCoverUrl(pl, cb) {
+  const custom = plGetCustomCover(pl.id);
+  if (custom) return cb(custom);
+  const first = pl.rel.length ? trackByRel(pl.rel[0]) : null;
+  if (!first) return cb(null);
+  getCachedCover(first).then((url) => {
+    if (url) return cb(url);
+    prefetchCover(first).then(() => getCachedCover(first).then((u) => cb(u || null)));   // 없으면 받아 캐시 후 갱신
+  });
+}
+
 function renderPlaylists() {
   const box = $("#pl-list");
+  const head = $(".pl-head");
+  if (selectedPlaylistId) { if (head) head.hidden = true; return renderPlaylistDetail(box); }
+  if (head) head.hidden = false;
   if (!playlists.length) { box.innerHTML = `<div class="pl-empty">플레이리스트가 없습니다.<br>+새로 만들어 곡을 담아보세요.</div>`; return; }
   box.innerHTML = playlists.map((p) => `
-    <div class="pl-item" data-pl="${p.id}">
-      <div class="track-thumb">≡</div>
+    <div class="pl-item" data-plopen="${p.id}">
+      <div class="pl-thumb"><img class="pl-cover" data-plc="${p.id}" alt=""></div>
       <div class="pl-item-body">
         <div class="pl-item-name">${escapeHtml(p.name)}</div>
         <div class="pl-item-sub">${p.rel.length}곡</div>
       </div>
-      <button class="track-add" data-plplay="${p.id}">▶</button>
+      <button class="pl-play-btn" data-plplay="${p.id}">▶</button>
     </div>`).join("");
+  for (const p of playlists) {
+    const img = box.querySelector(`.pl-cover[data-plc="${p.id}"]`);
+    if (img) plCoverUrl(p, (url) => setThumb(img, url));
+  }
 }
+function renderPlaylistDetail(box) {
+  const pl = playlists.find((p) => p.id === selectedPlaylistId);
+  if (!pl) { selectedPlaylistId = null; return renderPlaylists(); }
+  const rows = pl.rel.map((rel, i) => {
+    const t = trackByRel(rel);
+    const title = t ? t.title : (rel.split("/").pop() || rel);
+    const artist = t ? (t.artist || "알 수 없는 아티스트") : "라이브러리에 없음";
+    return `<div class="pld-track${t ? "" : " missing"}" data-pos="${i}">
+        <div class="track-body">
+          <div class="track-title">${escapeHtml(title)}</div>
+          <div class="track-artist">${escapeHtml(artist)}</div>
+        </div>
+        <button class="pld-remove" data-rm="${i}" title="목록에서 빼기">×</button>
+      </div>`;
+  }).join("") || `<div class="pl-empty">담긴 곡이 없습니다.<br>‘＋ 곡’으로 담아보세요.</div>`;
+  box.innerHTML = `
+    <div class="pld-head">
+      <button class="pld-back" id="pl-back">‹</button>
+      <div class="pld-name">${escapeHtml(pl.name)} <span class="pld-cnt">${pl.rel.length}곡</span></div>
+      <button class="pld-icon" id="pl-cover-btn" title="커버 사진 설정">🖼</button>
+      <button class="pld-icon" id="pl-del-btn" title="플레이리스트 삭제">🗑</button>
+      <button class="pld-add" id="pl-add-btn">＋ 곡</button>
+    </div>
+    <div class="pld-list">${rows}</div>`;
+}
+// 새 곡을 특정 플레이리스트에 담는다(curIndex 안 건드림).
+function addRelToPlaylist(pl, rel) {
+  if (!rel) return false;
+  if (pl.rel.includes(rel)) return false;
+  pl.rel.push(rel); pl.ts = Date.now();
+  savePlaylists();
+  return true;
+}
+function removeFromPlaylistAt(pl, pos) {
+  if (pos < 0 || pos >= pl.rel.length) return;
+  pl.rel.splice(pos, 1); pl.ts = Date.now();
+  savePlaylists(); renderPlaylists();
+}
+// 현재 재생 곡을 플레이리스트에 담기(기존 진입점 유지 — 재생화면 ＋ 버튼용).
 function addCurrentToPlaylist() {
   if (curIndex < 0) return toast("재생 중인 곡이 없습니다.");
-  const track = library[curIndex];
+  addTrackToPlaylist(library[curIndex]);
+}
+// 임의의 트랙을 담기: 대상 플레이리스트를 고르거나 새로 만든다(prompt).
+function addTrackToPlaylist(track) {
+  if (!track) return;
   const names = playlists.map((p, i) => `${i + 1}. ${p.name}`).join("\n");
   const ans = prompt(`담을 플레이리스트 번호 (또는 새 이름 입력):\n${names || "(없음)"}`, "");
   if (ans == null) return;
   let pl = playlists[+ans - 1];
   if (!pl) { pl = { id: Date.now().toString(36), name: ans.trim() || "새 목록", rel: [], ts: Date.now() }; playlists.push(pl); }
-  if (!pl.rel.includes(track.rel)) pl.rel.push(track.rel);
-  pl.ts = Date.now();
-  savePlaylists(); renderPlaylists(); toast(`'${pl.name}'에 담았어요.`);
+  const added = addRelToPlaylist(pl, track.rel);
+  renderPlaylists();
+  toast(added ? `'${pl.name}'에 담았어요.` : `이미 '${pl.name}'에 있어요.`);
+}
+
+/* ── 재생 큐(플레이리스트를 순서대로) ── */
+function playlistIndices(pl) {
+  const out = [];
+  for (const rel of pl.rel) {
+    const id = relToId.get(rel);
+    const idx = id ? library.findIndex((t) => t.id === id) : -1;
+    if (idx >= 0) out.push(idx);
+  }
+  return out;
+}
+function playPlaylistFrom(pl, startRelPos) {
+  const idxs = playlistIndices(pl);
+  if (!idxs.length) return toast("재생할 수 있는 곡이 없습니다(라이브러리 새로고침 필요).");
+  let qpos = 0;
+  if (startRelPos != null) {   // rel 인덱스 → 큐(라이브러리에 있는 곡만) 위치로 환산
+    for (let i = 0; i < startRelPos && i < pl.rel.length; i++) {
+      const id = relToId.get(pl.rel[i]);
+      if (id && library.some((t) => t.id === id)) qpos++;
+    }
+    if (qpos >= idxs.length) qpos = 0;
+  }
+  plQueue = idxs; plQueuePos = qpos;
+  playByLibIndex(plQueue[plQueuePos]);
 }
 function playPlaylist(id) {
-  const pl = playlists.find((p) => p.id === id); if (!pl || !pl.rel.length) return toast("빈 목록입니다.");
-  const firstId = relToId.get(pl.rel[0]);
-  const first = firstId ? library.findIndex((t) => t.id === firstId) : -1;
-  if (first >= 0) playByLibIndex(first); else toast("곡을 찾을 수 없습니다(라이브러리 새로고침 필요).");
+  const pl = playlists.find((p) => p.id === id);
+  if (!pl || !pl.rel.length) return toast("빈 목록입니다.");
+  playPlaylistFrom(pl, 0);
+}
+function deleteSelectedPlaylist() {
+  const pl = playlists.find((p) => p.id === selectedPlaylistId);
+  if (!pl) return;
+  if (!confirm(`'${pl.name}' 플레이리스트를 삭제할까요?`)) return;
+  playlists = playlists.filter((p) => p.id !== pl.id);
+  plTombs[pl.id] = Date.now();          // 삭제 기록(PC에도 전파)
+  plSetCustomCover(pl.id, null);
+  selectedPlaylistId = null;
+  savePlaylists(); renderPlaylists();
+  toast("삭제했습니다.");
+}
+// 이미지를 정사각형으로 center-crop 후 size px로 줄여 data URL(JPEG)로 만든다.
+function fileToCoverDataUrl(file, size, cb) {
+  const r = new FileReader();
+  r.onload = () => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const c = document.createElement("canvas"); c.width = size; c.height = size;
+        const ctx = c.getContext("2d");
+        const s = Math.min(img.width, img.height);
+        ctx.drawImage(img, (img.width - s) / 2, (img.height - s) / 2, s, s, 0, 0, size, size);
+        cb(c.toDataURL("image/jpeg", 0.85));
+      } catch (_) { cb(null); }
+    };
+    img.onerror = () => cb(null);
+    img.src = r.result;
+  };
+  r.onerror = () => cb(null);
+  r.readAsDataURL(file);
+}
+
+/* ── '곡 추가' 피커(전체화면 오버레이) ── */
+function openAddPicker() {
+  if (!selectedPlaylistId) return;
+  pickerPlId = selectedPlaylistId;
+  const pl = playlists.find((p) => p.id === pickerPlId);
+  $("#plp-name").textContent = pl ? pl.name : "";
+  $("#plp-search").value = "";
+  $("#pl-picker").hidden = false;
+  renderPickerList("");
+  try { history.pushState({ taPicker: 1 }, ""); } catch (_) {}
+  $("#plp-search").focus();
+}
+function closeAddPicker() {
+  const p = $("#pl-picker");
+  if (p.hidden) return;
+  p.hidden = true; pickerPlId = null;
+  renderPlaylists();   // 담은 결과 반영
+}
+function renderPickerList(q) {
+  const box = $("#plp-list");
+  const pl = playlists.find((p) => p.id === pickerPlId);
+  const has = new Set(pl ? pl.rel : []);
+  q = (q || "").trim().toLowerCase();
+  let list = library;
+  if (q) list = library.filter((t) => (t.title || "").toLowerCase().includes(q) || (t.artist || "").toLowerCase().includes(q));
+  const CAP = 200;
+  const shown = list.slice(0, CAP);
+  box.innerHTML = shown.map((t) => {
+    const inp = has.has(t.rel);
+    return `<div class="track" data-pick="${t.id}">
+        <div class="track-body">
+          <div class="track-title">${escapeHtml(t.title)}</div>
+          <div class="track-artist">${escapeHtml(t.artist || "알 수 없는 아티스트")}</div>
+        </div>
+        <button class="track-add${inp ? " added" : ""}" data-pickadd="${t.id}">${inp ? "✓" : "＋"}</button>
+      </div>`;
+  }).join("") + (list.length > CAP ? `<div class="pl-empty">…외 ${list.length - CAP}곡. 검색으로 좁혀주세요.</div>` : "")
+    || `<div class="pl-empty">검색 결과가 없습니다.</div>`;
 }
 
 /* ───────────────────── 화면 전환 ───────────────────── */
@@ -1287,15 +1480,17 @@ function bind() {
   // 트랙 목록 / 앨범 카드: 재생 / 담기
   $("#track-list").addEventListener("click", (e) => {
     const add = e.target.closest("[data-add]");
-    if (add) { e.stopPropagation(); const t = library.find((x) => x.id === add.dataset.add); if (t) { curIndex = library.indexOf(t); addCurrentToPlaylist(); } return; }
+    if (add) { e.stopPropagation(); const t = library.find((x) => x.id === add.dataset.add); if (t) addTrackToPlaylist(t); return; }
     const card = e.target.closest(".album-card");
     if (card) {
       const firstId = card.dataset.ids.split(",")[0];
+      plQueue = null;   // 라이브러리에서 직접 재생 → 플레이리스트 큐 해제
       playByLibIndex(library.findIndex((t) => t.id === firstId));
       openPlayer();
       return;
     }
     const li = e.target.closest(".track"); if (!li) return;
+    plQueue = null;
     playByLibIndex(library.findIndex((t) => t.id === li.dataset.id));
     openPlayer();
   });
@@ -1306,12 +1501,53 @@ function bind() {
   // 플레이리스트
   $("#btn-pl-new").addEventListener("click", () => {
     const name = prompt("새 플레이리스트 이름"); if (!name) return;
-    playlists.push({ id: Date.now().toString(36), name: name.trim(), ids: [] });
+    playlists.push({ id: Date.now().toString(36), name: name.trim(), rel: [], ts: Date.now() });
     savePlaylists(); renderPlaylists();
   });
   $("#pl-list").addEventListener("click", (e) => {
     const play = e.target.closest("[data-plplay]");
-    if (play) { playPlaylist(play.dataset.plplay); openPlayer(); return; }
+    if (play) { e.stopPropagation(); playPlaylist(play.dataset.plplay); openPlayer(); return; }
+    const open = e.target.closest("[data-plopen]");
+    if (open) { selectedPlaylistId = open.dataset.plopen; renderPlaylists(); return; }
+    if (e.target.closest("#pl-back")) { selectedPlaylistId = null; renderPlaylists(); return; }
+    if (e.target.closest("#pl-add-btn")) { openAddPicker(); return; }
+    if (e.target.closest("#pl-cover-btn")) { pendingCoverPl = selectedPlaylistId; $("#pl-cover-file").click(); return; }
+    if (e.target.closest("#pl-del-btn")) { deleteSelectedPlaylist(); return; }
+    const rm = e.target.closest(".pld-remove");
+    if (rm) { e.stopPropagation(); const pl = playlists.find((p) => p.id === selectedPlaylistId); if (pl) removeFromPlaylistAt(pl, parseInt(rm.dataset.rm)); return; }
+    const row = e.target.closest(".pld-track");
+    if (row) { const pl = playlists.find((p) => p.id === selectedPlaylistId); if (pl) { playPlaylistFrom(pl, parseInt(row.dataset.pos)); openPlayer(); } return; }
+  });
+  // '곡 추가' 피커
+  $("#plp-close").addEventListener("click", () => { if (history.state && history.state.taPicker) history.back(); else closeAddPicker(); });
+  let pickerSearchT = null;
+  $("#plp-search").addEventListener("input", (e) => {
+    clearTimeout(pickerSearchT);
+    const v = e.target.value;
+    pickerSearchT = setTimeout(() => renderPickerList(v), 150);
+  });
+  $("#plp-list").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-pickadd]");
+    if (!b) return;
+    const pl = playlists.find((p) => p.id === pickerPlId);
+    const t = library.find((x) => x.id === b.dataset.pickadd);
+    if (!pl || !t) return;
+    if (addRelToPlaylist(pl, t.rel)) { b.textContent = "✓"; b.classList.add("added"); toast("담았어요."); }
+    else toast("이미 담겨 있어요.");
+  });
+
+  // 커버 사진 선택 → 정사각 400px로 축소해 로컬 저장(동기화 안 함, 용량 최소화).
+  const coverFile = $("#pl-cover-file");
+  if (coverFile) coverFile.addEventListener("change", () => {
+    const f = coverFile.files && coverFile.files[0]; coverFile.value = "";
+    if (!f || !pendingCoverPl) return;
+    const pid = pendingCoverPl; pendingCoverPl = null;
+    fileToCoverDataUrl(f, 400, (url) => {
+      if (!url) return toast("이미지를 불러오지 못했습니다.");
+      plSetCustomCover(pid, url);
+      if (activeTab === "playlists") renderPlaylists();
+      toast("커버를 설정했습니다.");
+    });
   });
 
   // 미니 플레이어
@@ -1331,7 +1567,9 @@ function bind() {
   //  · 어느 경우든 히스토리 트랩을 다시 세워 '이전'으로 앱이 종료되지 않게 함
   //  → 완전히 끄려면 홈(백그라운드 재생 유지) 또는 '최근 앱'에서 밀기.
   window.addEventListener("popstate", () => {
+    if (!$("#pl-picker").hidden) { closeAddPicker(); pushGuard(); return; }   // 피커 먼저 닫기
     if (!$("#player").hidden) { closePlayerUI(); pushGuard(); return; }
+    if (selectedPlaylistId && activeTab === "playlists") { selectedPlaylistId = null; renderPlaylists(); pushGuard(); return; }
     if (!LS.get("back_hint", false)) {   // 메인에서 첫 '이전' 때 한 번만 안내
       toast("홈 버튼으로 나가면 음악이 계속 재생됩니다");
       LS.set("back_hint", true);

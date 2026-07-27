@@ -162,6 +162,17 @@
   </div>
 </section>
 
+<!-- ─────────── 곡 추가 피커 ─────────── -->
+<section id="pl-picker" class="screen picker" hidden>
+  <header class="appbar">
+    <button id="plp-close" class="icon-btn">‹</button>
+    <div class="appbar-title">곡 추가 · <span id="plp-name"></span></div>
+  </header>
+  <div class="searchbar"><input id="plp-search" type="search" placeholder="곡·아티스트 검색" autocomplete="off"></div>
+  <div id="plp-list" class="track-list"></div>
+</section>
+<input type="file" id="pl-cover-file" accept="image/*" hidden>
+
 <audio id="audio" preload="auto"></audio>
 <button id="install-fab" class="install-fab" hidden>⬇ 앱 설치</button>
 <div id="toast" class="toast" hidden></div>
