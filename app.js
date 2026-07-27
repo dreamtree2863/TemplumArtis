@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v13";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v14";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -953,13 +953,19 @@ function openPlayer() {
   // 이 상태를 되돌리며(popstate) 재생화면만 닫게 한다 → 앱 유지 → 재생 지속.
   try { history.pushState({ taPlayer: 1 }, ""); } catch (_) {}
   p.hidden = false;
+  // 전체화면 재생 화면이 뜨는 동안 하단 미니바·설치 버튼은 숨긴다(화면 전체 차지).
+  $("#mini").hidden = true;
+  hideInstallFab();
   requestAnimationFrame(() => p.classList.add("up"));
 }
 function closePlayerUI() {
   const p = $("#player");
   if (p.hidden) return;
   p.classList.remove("up");
-  setTimeout(() => (p.hidden = true), 340);
+  setTimeout(() => {
+    p.hidden = true;
+    if (curIndex >= 0) $("#mini").hidden = false;   // 닫히면 미니바 복귀(재생 중일 때)
+  }, 340);
 }
 function closePlayer() {
   // ▾ 닫기 버튼: 히스토리를 되돌려 popstate 경로로 닫음(상태 일관 유지).

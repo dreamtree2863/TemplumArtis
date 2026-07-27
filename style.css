@@ -131,8 +131,9 @@ img{display:block}
 .tab.active{color:var(--accent)}
 
 /* ───── 전체 재생 화면 ───── */
-.player{background:linear-gradient(165deg,#241e18,#1b1712);color:var(--dark-ink);
-  transform:translateY(100%);transition:transform .34s cubic-bezier(.3,.9,.3,1);z-index:50}
+.player{position:fixed;inset:0;display:flex;flex-direction:column;
+  background:linear-gradient(165deg,#241e18,#1b1712);color:var(--dark-ink);
+  transform:translateY(100%);transition:transform .34s cubic-bezier(.3,.9,.3,1);z-index:60}
 .player.up{transform:translateY(0)}
 .player-top{display:flex;align-items:center;gap:8px;padding:calc(var(--safe-top) + 8px) 12px 6px}
 .player-top .icon-btn{color:var(--dark-muted)}
