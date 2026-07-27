@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v23";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v24";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -241,6 +241,23 @@ function coverDiagNote(kind, bytes) {
     : `커버: Drive 썸네일 미작동 → 임베디드 폴백 중`;
   console.log("[coverDiag]", msg, coverDiag);
   toast(msg);
+}
+
+// 강제 진단: 캐시를 무시하고 라이브러리의 한 곡으로 Drive 썸네일을 실제로 받아보고
+// 결과(작동/폴백 + 용량)를 화면에 한 번 알린다. 캐시 히트로 진단이 안 뜨는 걸 방지.
+let thumbProbed = false;
+async function probeDriveThumb() {
+  if (thumbProbed || !library.length) return;
+  thumbProbed = true;
+  const t = library.find((x) => x.id && x.hasThumb !== false) || library[0];
+  try {
+    const r = await driveThumbBytes(t, COVER_THUMB_PX);
+    toast(r ? `커버 진단: Drive 썸네일 작동 ✓ (${Math.round(r.data.length / 1024)}KB)`
+            : `커버 진단: Drive 썸네일 미작동 → 임베디드 폴백`);
+    console.log("[coverProbe]", r ? `ok ${r.data.length}B` : "no-thumbnail/failed", t && t.name);
+  } catch (e) {
+    toast("커버 진단: 오류 " + (e && e.message || e));
+  }
 }
 
 // 한 곡 커버를 백그라운드로 미리 받아 캐시. 먼저 Drive 서버 썸네일(작고 빠름),
@@ -713,6 +730,17 @@ async function playByLibIndex(i, opts = {}) {
     curCoverUrl = url; shownCoverForId = track.id;
     setCoverImg("#cover", url); setCoverImg("#mini-art", url);
   });
+  // 캐시에 없으면 Drive 서버 썸네일을 병렬로 빠르게 받아 표시한다(무거운 256KB 태그
+  // fetch를 기다리지 않음). 태그 fetch의 임베디드 커버는 뒤에서 폴백으로만 쓴다.
+  driveThumbBytes(track, 1024).then((thumb) => {
+    if (!thumb || i !== curIndex || shownCoverForId === track.id) { thumb && coverDiagNote("thumb", thumb.data.length); return; }
+    putCachedCover(track, thumb.data, thumb.mime);
+    const u = URL.createObjectURL(new Blob([thumb.data], { type: thumb.mime }));
+    if (curCoverUrl) URL.revokeObjectURL(curCoverUrl);
+    curCoverUrl = u; shownCoverForId = track.id;
+    setCoverImg("#cover", u); setCoverImg("#mini-art", u);
+    coverDiagNote("thumb", thumb.data.length);
+  });
 
   try {
     await ensureToken();
@@ -730,14 +758,13 @@ async function playByLibIndex(i, opts = {}) {
       track.album = m.album || ""; track.year = m.year || ""; track.genre = m.genre || "";
       track.enriched = true;
       persistLibrary();               // 읽은 태그를 캐시에 저장(다음엔 앨범/정렬에 바로 반영)
-      if (m.cover) {
-        putCachedCover(track, m.cover.data, m.cover.mime);   // 다음 재생 땐 즉시 표시
-        // 캐시가 이미 이 곡 커버를 띄웠으면 다시 만들지 않는다(깜빡임 방지).
-        if (shownCoverForId !== track.id) {
-          if (curCoverUrl) URL.revokeObjectURL(curCoverUrl);
-          curCoverUrl = URL.createObjectURL(new Blob([m.cover.data], { type: m.cover.mime }));
-          shownCoverForId = track.id;
-        }
+      // Drive 썸네일이 이미 커버를 띄웠으면 임베디드는 건드리지 않는다(썸네일 유지·중복 방지).
+      // 썸네일이 없거나 늦으면(그새 안 떴으면) 임베디드 커버로 폴백 표시.
+      if (m.cover && shownCoverForId !== track.id) {
+        putCachedCover(track, m.cover.data, m.cover.mime);
+        if (curCoverUrl) URL.revokeObjectURL(curCoverUrl);
+        curCoverUrl = URL.createObjectURL(new Blob([m.cover.data], { type: m.cover.mime }));
+        shownCoverForId = track.id;
       }
       setNowPlaying({ title, artist, album: m.album, year: m.year, genre: m.genre, cover: curCoverUrl });
       setLyrics(m.uslt);
@@ -1511,6 +1538,7 @@ async function loadLibrary(forceRefresh) {
     status.textContent = `${library.length}곡 (캐시) · ⟳ 로 새로고침`;
     syncPlaylists();   // 라이브러리 준비됨 → 플레이리스트 동기화(rel 매핑 필요)
     enrichAllBg();     // 캐시에 아직 태그 없는 곡이 있으면 백그라운드로 마저 채운다
+    setTimeout(probeDriveThumb, 800);   // 커버 로딩 방식 진단(한 번)
     return;
   }
   const paths = getFolderPaths();
@@ -1536,6 +1564,7 @@ async function loadLibrary(forceRefresh) {
     LS.set("pl_parent", plParentId);   // 캐시 로드 시 재사용
     syncPlaylists();                   // 플레이리스트 PC와 동기화
     enrichAllBg();                     // 전 곡 태그를 백그라운드로 미리 읽어 캐시(처음부터 실제 태그)
+    setTimeout(probeDriveThumb, 800);   // 커버 로딩 방식 진단(한 번)
   } catch (e) {
     status.textContent = "";
     $("#track-list").innerHTML = `<li class="entries-empty">목록 로딩 실패: ${escapeHtml(e.message)}</li>`;
