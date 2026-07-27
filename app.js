@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v24";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v25";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -202,73 +202,109 @@ async function putCachedCover(t, bytes, mime) {
     LS.set(COVER_KEYS, keys);
   } catch (_) {}
 }
-// Drive가 서버에서 리사이즈해주는 썸네일(thumbnailLink)로 커버를 받는다. 곡 파일에
-// 박힌 원본 커버는 500~1000px·평균 198KB(최대 2.8MB)라 표시 크기(썸네일 160px,
-// 전체화면 ~1000px)에 비해 과하다. =s{px} 로 필요한 크기만 받아 10~20배 적게 다운로드.
-// thumbnailLink는 짧게 만료되므로 쓸 때마다 새로 받아온다. 실패하면 null → 임베디드 폴백.
-const COVER_THUMB_PX = 512;   // 플레이리스트 썸네일·다음곡 미리보기용(전체화면은 재생 시 원본으로 교체)
-function sizedThumb(link, px) {
-  return /=s\d+/.test(link) ? link.replace(/=s\d+(-[a-z]+)?/, "=s" + px) : link + "=s" + px;
+// ── 공유 커버 파일(_covers/) : PC가 512px JPEG로 미리 뽑아둔 걸 바로 받는다 ──
+// 곡 파일(200KB±)을 열어 커버를 추출하는 대신, 음악 폴더의 _covers/<rel해시>.jpg
+// 작은 파일(≈20~60KB) 하나만 받는다. PC와 같은 rel 해시(SHA-256 앞 16자리, NFC)를 쓴다.
+let coverFolderId = null;      // _covers 폴더 id
+let coverMap = null;           // {rel해시: 파일ID}
+let coverMapLoading = null;
+async function relHash(rel) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode((rel || "").normalize("NFC")));
+  return [...new Uint8Array(buf)].slice(0, 8).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
-async function driveThumbBytes(t, px) {
-  if (t.hasThumb === false) return null;
+async function ensureCoverMap() {
+  if (coverMap) return coverMap;
+  if (coverMapLoading) return coverMapLoading;
+  coverMapLoading = (async () => {
+    const map = {};
+    try {
+      if (!plParentId) { plParentId = LS.get("pl_parent", null); }
+      if (!plParentId) return map;
+      const token = await ensureToken();
+      const fq = encodeURIComponent(
+        `name='_covers' and '${plParentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`);
+      const fr = await fetch(
+        `https://www.googleapis.com/drive/v3/files?q=${fq}&fields=files(id)&pageSize=1&spaces=drive`,
+        { headers: { Authorization: "Bearer " + token } }).then((r) => (r.ok ? r.json() : null));
+      coverFolderId = fr && fr.files && fr.files[0] ? fr.files[0].id : null;
+      if (!coverFolderId) return map;
+      let pageToken = "";
+      do {
+        const q = encodeURIComponent(`'${coverFolderId}' in parents and trashed=false`);
+        const url = `https://www.googleapis.com/drive/v3/files?q=${q}` +
+          `&fields=nextPageToken,files(id,name)&pageSize=1000&spaces=drive` +
+          (pageToken ? `&pageToken=${pageToken}` : "");
+        const data = await fetch(url, { headers: { Authorization: "Bearer " + token } })
+          .then((r) => (r.ok ? r.json() : null));
+        if (!data) break;
+        for (const f of data.files || []) {
+          const key = (f.name || "").replace(/\.jpg$/i, "");
+          if (key) map[key] = f.id;
+        }
+        pageToken = data.nextPageToken || "";
+      } while (pageToken);
+    } catch (_) {}
+    coverMap = map;
+    return map;
+  })();
+  return coverMapLoading;
+}
+// 공유 커버 파일 바이트를 받아온다(없으면 null → 임베디드 폴백).
+async function storeCoverBytes(t) {
+  if (!t || !t.rel) return null;
   try {
+    const map = await ensureCoverMap();
+    const id = map[await relHash(t.rel)];
+    if (!id) return null;
     const token = await ensureToken();
-    const meta = await fetch(
-      `https://www.googleapis.com/drive/v3/files/${t.id}?fields=hasThumbnail,thumbnailLink`,
-      { headers: { Authorization: "Bearer " + token } }).then((r) => (r.ok ? r.json() : null));
-    if (!meta) return null;
-    t.hasThumb = !!meta.hasThumbnail;
-    if (!meta.hasThumbnail || !meta.thumbnailLink) return null;
-    const r = await fetch(sizedThumb(meta.thumbnailLink, px),
+    const r = await fetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`,
       { headers: { Authorization: "Bearer " + token } });
     if (!r.ok) return null;
-    return { data: new Uint8Array(await r.arrayBuffer()), mime: r.headers.get("content-type") || "image/jpeg" };
+    return { data: new Uint8Array(await r.arrayBuffer()), mime: "image/jpeg" };
   } catch (_) { return null; }
 }
 
-// ── 커버 로딩 자가 진단(임시): 첫 몇 개 커버가 Drive 썸네일로 받아지는지 화면에 보고 ──
-let coverDiag = { thumb: 0, thumbBytes: 0, embed: 0, done: 0, reported: false };
+// ── 커버 로딩 자가 진단(임시): 공유 커버 파일 vs 임베디드 어느 쪽으로 받는지 보고 ──
+let coverDiag = { store: 0, storeBytes: 0, embed: 0, done: 0, reported: false };
 function coverDiagNote(kind, bytes) {
   if (coverDiag.reported) return;
-  if (kind === "thumb") { coverDiag.thumb++; coverDiag.thumbBytes += bytes || 0; }
+  if (kind === "store") { coverDiag.store++; coverDiag.storeBytes += bytes || 0; }
   else { coverDiag.embed++; }
   if (++coverDiag.done < 5) return;
   coverDiag.reported = true;
-  const avg = coverDiag.thumb ? Math.round(coverDiag.thumbBytes / coverDiag.thumb / 1024) : 0;
-  const msg = coverDiag.thumb
-    ? `커버: Drive 썸네일 ${coverDiag.thumb}/${coverDiag.done} · 평균 ${avg}KB ✓`
-    : `커버: Drive 썸네일 미작동 → 임베디드 폴백 중`;
+  const avg = coverDiag.store ? Math.round(coverDiag.storeBytes / coverDiag.store / 1024) : 0;
+  const msg = coverDiag.store
+    ? `커버: 공유 파일 ${coverDiag.store}/${coverDiag.done} · 평균 ${avg}KB ✓`
+    : `커버: 공유 파일 없음 → 임베디드 폴백 (PC가 아직 생성 중일 수 있음)`;
   console.log("[coverDiag]", msg, coverDiag);
   toast(msg);
 }
 
-// 강제 진단: 캐시를 무시하고 라이브러리의 한 곡으로 Drive 썸네일을 실제로 받아보고
-// 결과(작동/폴백 + 용량)를 화면에 한 번 알린다. 캐시 히트로 진단이 안 뜨는 걸 방지.
-let thumbProbed = false;
-async function probeDriveThumb() {
-  if (thumbProbed || !library.length) return;
-  thumbProbed = true;
-  const t = library.find((x) => x.id && x.hasThumb !== false) || library[0];
+// 진단: _covers 폴더에 공유 커버가 몇 개 있는지 한 번 알린다(PC 생성 여부 확인용).
+let coverStoreProbed = false;
+async function probeCoverStore() {
+  if (coverStoreProbed || !library.length) return;
+  coverStoreProbed = true;
   try {
-    const r = await driveThumbBytes(t, COVER_THUMB_PX);
-    toast(r ? `커버 진단: Drive 썸네일 작동 ✓ (${Math.round(r.data.length / 1024)}KB)`
-            : `커버 진단: Drive 썸네일 미작동 → 임베디드 폴백`);
-    console.log("[coverProbe]", r ? `ok ${r.data.length}B` : "no-thumbnail/failed", t && t.name);
+    const map = await ensureCoverMap();
+    const n = Object.keys(map).length;
+    toast(n ? `공유 커버 ${n}개 감지 — 커버 파일 사용 ✓`
+            : `공유 커버 폴더(_covers) 비어있음 — PC에서 생성 필요/진행중`);
+    console.log("[coverProbe] _covers files:", n, "folderId:", coverFolderId);
   } catch (e) {
-    toast("커버 진단: 오류 " + (e && e.message || e));
+    toast("커버 진단 오류: " + (e && e.message || e));
   }
 }
 
-// 한 곡 커버를 백그라운드로 미리 받아 캐시. 먼저 Drive 서버 썸네일(작고 빠름),
-// 없거나 실패하면 곡 파일의 임베디드 커버로 폴백.
+// 한 곡 커버를 백그라운드로 미리 받아 캐시. 먼저 공유 커버 파일(작고 빠름),
+// 없으면 곡 파일의 임베디드 커버로 폴백.
 async function prefetchCover(t) {
   if (!t || !t.id) return;
   try {
     const c = await caches.open(COVER_CACHE);
     if (await c.match(coverKey(t))) return;   // 이미 캐시됨
-    const thumb = await driveThumbBytes(t, COVER_THUMB_PX);
-    if (thumb) { putCachedCover(t, thumb.data, thumb.mime); coverDiagNote("thumb", thumb.data.length); return; }
+    const store = await storeCoverBytes(t);
+    if (store) { putCachedCover(t, store.data, store.mime); coverDiagNote("store", store.data.length); return; }
     const buf = await fetchTagExact(t.id);     // 폴백: 임베디드 커버
     if (!buf) return;
     const m = parseID3(buf);
@@ -311,7 +347,6 @@ function toTrack(f, rel) {
   return { id: f.id, name: f.name, size: +f.size || 0, rel: rel || f.name,
     artist: dash > 0 ? stem.slice(0, dash) : "",
     title: dash > 0 ? stem.slice(dash + 3) : stem,
-    hasThumb: f.hasThumbnail !== false,   // Drive 서버 썸네일 유무(없으면 임베디드 폴백)
     guessed: true };   // 아직 태그 미확인(추정값)
 }
 // 저장된 음악 폴더 경로 목록(My Drive 기준). 기본은 데스크톱 라이브러리 폴더.
@@ -346,7 +381,7 @@ async function listFolderAudio(rootIds, onProgress) {
     do {
       const q = encodeURIComponent(`'${parent}' in parents and trashed=false`);
       const url = `https://www.googleapis.com/drive/v3/files?q=${q}` +
-        `&fields=nextPageToken,files(id,name,size,mimeType,hasThumbnail)&pageSize=1000&orderBy=name&spaces=drive` +
+        `&fields=nextPageToken,files(id,name,size,mimeType)&pageSize=1000&orderBy=name&spaces=drive` +
         (pageToken ? `&pageToken=${pageToken}` : "");
       const data = await driveFetch(url, false);
       for (const f of data.files || []) {
@@ -730,16 +765,16 @@ async function playByLibIndex(i, opts = {}) {
     curCoverUrl = url; shownCoverForId = track.id;
     setCoverImg("#cover", url); setCoverImg("#mini-art", url);
   });
-  // 캐시에 없으면 Drive 서버 썸네일을 병렬로 빠르게 받아 표시한다(무거운 256KB 태그
+  // 캐시에 없으면 공유 커버 파일을 병렬로 빠르게 받아 표시한다(무거운 256KB 태그
   // fetch를 기다리지 않음). 태그 fetch의 임베디드 커버는 뒤에서 폴백으로만 쓴다.
-  driveThumbBytes(track, 1024).then((thumb) => {
-    if (!thumb || i !== curIndex || shownCoverForId === track.id) { thumb && coverDiagNote("thumb", thumb.data.length); return; }
-    putCachedCover(track, thumb.data, thumb.mime);
-    const u = URL.createObjectURL(new Blob([thumb.data], { type: thumb.mime }));
+  storeCoverBytes(track).then((cov) => {
+    if (!cov || i !== curIndex || shownCoverForId === track.id) { cov && coverDiagNote("store", cov.data.length); return; }
+    putCachedCover(track, cov.data, cov.mime);
+    const u = URL.createObjectURL(new Blob([cov.data], { type: cov.mime }));
     if (curCoverUrl) URL.revokeObjectURL(curCoverUrl);
     curCoverUrl = u; shownCoverForId = track.id;
     setCoverImg("#cover", u); setCoverImg("#mini-art", u);
-    coverDiagNote("thumb", thumb.data.length);
+    coverDiagNote("store", cov.data.length);
   });
 
   try {
@@ -1538,7 +1573,7 @@ async function loadLibrary(forceRefresh) {
     status.textContent = `${library.length}곡 (캐시) · ⟳ 로 새로고침`;
     syncPlaylists();   // 라이브러리 준비됨 → 플레이리스트 동기화(rel 매핑 필요)
     enrichAllBg();     // 캐시에 아직 태그 없는 곡이 있으면 백그라운드로 마저 채운다
-    setTimeout(probeDriveThumb, 800);   // 커버 로딩 방식 진단(한 번)
+    setTimeout(probeCoverStore, 800);   // 커버 로딩 방식 진단(한 번)
     return;
   }
   const paths = getFolderPaths();
@@ -1564,7 +1599,7 @@ async function loadLibrary(forceRefresh) {
     LS.set("pl_parent", plParentId);   // 캐시 로드 시 재사용
     syncPlaylists();                   // 플레이리스트 PC와 동기화
     enrichAllBg();                     // 전 곡 태그를 백그라운드로 미리 읽어 캐시(처음부터 실제 태그)
-    setTimeout(probeDriveThumb, 800);   // 커버 로딩 방식 진단(한 번)
+    setTimeout(probeCoverStore, 800);   // 커버 로딩 방식 진단(한 번)
   } catch (e) {
     status.textContent = "";
     $("#track-list").innerHTML = `<li class="entries-empty">목록 로딩 실패: ${escapeHtml(e.message)}</li>`;
