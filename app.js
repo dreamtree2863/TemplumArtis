@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v18";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v19";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -1076,6 +1076,7 @@ function renderPlaylistDetail(box) {
     const title = t ? t.title : (rel.split("/").pop() || rel);
     const artist = t ? (t.artist || "알 수 없는 아티스트") : "라이브러리에 없음";
     return `<div class="pld-track${t ? "" : " missing"}" data-pos="${i}"${t ? ` data-id="${t.id}"` : ""}>
+        <span class="pld-grip" data-grip="${i}" title="끌어서 순서 변경">⠿</span>
         <div class="track-body">
           <div class="track-title">${escapeHtml(title)}</div>
           <div class="track-artist">${escapeHtml(artist)}</div>
@@ -1106,6 +1107,59 @@ function removeFromPlaylistAt(pl, pos) {
   if (pos < 0 || pos >= pl.rel.length) return;
   pl.rel.splice(pos, 1); pl.ts = Date.now();
   savePlaylists(); renderPlaylists();
+}
+
+/* ── 곡 순서 바꾸기(손잡이 ⠿ 를 끌어서) ─────────────────────────────
+   포인터 이벤트로 터치·마우스 모두 지원. 끄는 행은 손가락을 따라 이동하고,
+   지나치는 행들은 자리를 비켜준다. 놓으면 새 순서를 rel에 반영·저장. */
+let pldDrag = null;
+function pldGripDown(e) {
+  const grip = e.target.closest(".pld-grip");
+  if (!grip) return;
+  const row = grip.closest(".pld-track");
+  const list = row && row.parentElement;
+  if (!row || !list) return;
+  e.preventDefault();
+  const rows = Array.from(list.querySelectorAll(".pld-track"));
+  const from = rows.indexOf(row);
+  pldDrag = { row, rows, startY: e.clientY, height: row.getBoundingClientRect().height, from, cur: from };
+  row.classList.add("dragging");
+  row.setPointerCapture && row.setPointerCapture(e.pointerId);
+  document.addEventListener("pointermove", pldGripMove);
+  document.addEventListener("pointerup", pldGripUp);
+  document.addEventListener("pointercancel", pldGripUp);
+}
+function pldGripMove(e) {
+  const d = pldDrag; if (!d) return;
+  const dy = e.clientY - d.startY;
+  d.row.style.transform = `translateY(${dy}px)`;
+  let target = d.from + Math.round(dy / d.height);
+  target = Math.max(0, Math.min(d.rows.length - 1, target));
+  if (target !== d.cur) {
+    d.cur = target;
+    d.rows.forEach((r, i) => {
+      if (r === d.row) return;
+      let shift = 0;
+      if (d.from < target && i > d.from && i <= target) shift = -d.height;
+      else if (d.from > target && i >= target && i < d.from) shift = d.height;
+      r.style.transform = shift ? `translateY(${shift}px)` : "";
+    });
+  }
+}
+function pldGripUp() {
+  const d = pldDrag; if (!d) return;
+  pldDrag = null;
+  document.removeEventListener("pointermove", pldGripMove);
+  document.removeEventListener("pointerup", pldGripUp);
+  document.removeEventListener("pointercancel", pldGripUp);
+  const pl = playlists.find((p) => p.id === selectedPlaylistId);
+  if (pl && d.from !== d.cur) {
+    const [moved] = pl.rel.splice(d.from, 1);
+    pl.rel.splice(d.cur, 0, moved);
+    pl.ts = Date.now();
+    savePlaylists();
+  }
+  renderPlaylists();   // 트랜스폼 초기화 겸 새 순서로 다시 그림
 }
 // 현재 재생 곡을 플레이리스트에 담기(기존 진입점 유지 — 재생화면 ＋ 버튼용).
 function addCurrentToPlaylist() {
@@ -1534,7 +1588,9 @@ function bind() {
     savePlaylists(); renderPlaylists();
   });
   $("#btn-pl-refresh").addEventListener("click", refreshPlaylists);
+  $("#pl-list").addEventListener("pointerdown", pldGripDown);
   $("#pl-list").addEventListener("click", (e) => {
+    if (e.target.closest(".pld-grip")) return;   // 손잡이 탭은 무시(순서 변경 전용)
     const play = e.target.closest("[data-plplay]");
     if (play) { e.stopPropagation(); playPlaylist(play.dataset.plplay); openPlayer(); return; }
     const open = e.target.closest("[data-plopen]");

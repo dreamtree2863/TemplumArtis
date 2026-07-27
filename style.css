@@ -126,10 +126,15 @@ img{display:block}
 .pld-cnt{font-weight:500;font-size:12.5px;color:var(--muted)}
 .pld-icon{width:38px;height:38px;flex:none;font-size:17px}
 .pld-add{flex:none;padding:8px 12px;border-radius:10px;background:var(--accent);color:#fff;font-weight:700;font-size:13px}
-.pld-track{display:flex;align-items:center;gap:10px;padding:12px 6px;border-bottom:1px solid var(--line);cursor:pointer}
+.pld-track{display:flex;align-items:center;gap:8px;padding:12px 6px;border-bottom:1px solid var(--line);cursor:pointer;transition:transform .15s ease;background:var(--bg)}
 .pld-track.missing{opacity:.45}
+.pld-track .track-body{flex:1;min-width:0}
 .pld-track .track-title{font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pld-track .track-artist{font-size:12.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pld-grip{flex:none;width:30px;text-align:center;color:var(--faint);font-size:17px;cursor:grab;
+  touch-action:none;user-select:none;-webkit-user-select:none;letter-spacing:1px}
+.pld-track.dragging{transition:none;position:relative;z-index:5;cursor:grabbing;border-bottom-color:transparent;
+  border-radius:12px;box-shadow:0 8px 24px rgba(30,20,10,.28)}
 .pld-remove{width:34px;height:34px;flex:none;color:var(--faint);font-size:20px}
 /* 곡 추가 피커(전체화면) */
 .picker{z-index:70;background:var(--bg)}
