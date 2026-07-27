@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v19";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v20";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -1373,7 +1373,18 @@ async function enrichOne(t) {
 // 목록·재생 정보가 추정값 없이 처음부터 실제 태그로 뜬다(곡당 32KB, 한 번만·영구 캐시).
 // 큐(동시 6개)로 처리하므로 재생/커버 프리페치와 함께 돌아도 무리가 없다.
 function enrichAllBg() {
-  for (const t of library) if (!t.enriched) queueEnrich(t);
+  // 플레이리스트(자주 듣는 곡)를 선제적으로 먼저 읽어, 목록·플레이리스트 상세에
+  // 실제 태그가 빨리 뜨게 한다. 나머지 곡은 그 뒤로 이어서 채운다.
+  const items = (playlists && playlists.length) ? playlists : (LS.get("pl_items", []) || []);
+  const plRels = new Set();
+  for (const p of items) for (const r of (p.rel || [])) plRels.add(r);
+  const inPl = [], rest = [];
+  for (const t of library) {
+    if (t.enriched) continue;
+    (plRels.has(t.rel) ? inPl : rest).push(t);
+  }
+  for (const t of inPl) queueEnrich(t);
+  for (const t of rest) queueEnrich(t);
 }
 // 이미 화면에 있는 행이면 값만 제자리 갱신(다시 그리지 않아 스크롤·깜빡임 없음).
 function updateRowInPlace(t) {
