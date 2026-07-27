@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v29";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v30";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -495,10 +495,16 @@ function sortTracks(arr) {
   return arr.sort((a, b) =>
     sortKey(a).localeCompare(sortKey(b), "ko") || (a.title || "").localeCompare(b.title || "", "ko"));
 }
+// 검색 정규화: 소문자 + NFC + 공백/괄호/기호 제거. '여자친구 (GFRIEND)'가 '여자친구',
+// 'gfriend', '여자친구(gfriend)' 어느 걸로 쳐도 잡히고, 띄어쓰기·대소문자 차이를 무시한다.
+function normSearch(s) {
+  return (s || "").normalize("NFC").toLowerCase().replace(/[\s()[\]{}.\-_/&·,'"!?~]+/g, "");
+}
 function applySearch() {
-  const q = $("#search").value.trim().toLowerCase();
+  const raw = $("#search").value.trim();
+  const q = normSearch(raw);
   filtered = q
-    ? library.filter((t) => (t.title + " " + t.artist + " " + (t.album || "") + " " + t.name).toLowerCase().includes(q))
+    ? library.filter((t) => normSearch(t.title + t.artist + (t.album || "") + t.name).includes(q))
     : library.slice();
   sortTracks(filtered);
   render();
@@ -1531,9 +1537,9 @@ function renderPickerList(q) {
   const box = $("#plp-list");
   const pl = playlists.find((p) => p.id === pickerPlId);
   const has = new Set(pl ? pl.rel : []);
-  q = (q || "").trim().toLowerCase();
+  q = normSearch(q || "");
   let list = library;
-  if (q) list = library.filter((t) => (t.title || "").toLowerCase().includes(q) || (t.artist || "").toLowerCase().includes(q));
+  if (q) list = library.filter((t) => normSearch((t.title || "") + (t.artist || "")).includes(q));
   const CAP = 200;
   const shown = list.slice(0, CAP);
   box.innerHTML = shown.map((t) => {
