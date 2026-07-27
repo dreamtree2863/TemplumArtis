@@ -4,7 +4,9 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v6";   // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v7";   // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
+const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const LS = {
@@ -42,7 +44,7 @@ let curCoverUrl = null;
   const t = LS.get("token", null);
   if (t && t.t && t.exp > Date.now()) { accessToken = t.t; tokenExp = t.exp; }
 })();
-let library = [];            // [{id, name, title, artist, size}]
+let library = [];            // [{id, name, title, artist, size, album, year, genre, enriched}]
 let filtered = [];
 let curIndex = -1;
 let curObjectUrl = null;
@@ -52,8 +54,27 @@ let curLyricLine = -1;
 let playlists = LS.get("playlists", []);
 let activeTab = "library";
 let appEntered = false;
+let sortMode = LS.get("sort_mode", "title");   // title|artist|album|year|genre
+let viewMode = "list";       // list|album
 
-const audio = $("#audio");
+// 크로스페이드용 오디오 2개. audio는 항상 '활성' 요소를 가리키고, spare는 대기.
+// 곡을 바꿀 때 spare에 새 곡을 올려 서로 볼륨을 교차시킨 뒤 역할을 바꾼다.
+let audio = $("#audio");
+let spare = document.createElement("audio");
+spare.preload = "auto";
+document.body.appendChild(spare);
+// iOS Safari는 audio.volume이 읽기 전용(하드웨어 볼륨만) → 크로스페이드 불가.
+// 값을 넣어보고 반영되는지로 판별하고, 안 되면 즉시 전환으로 폴백한다.
+let crossfadeOK = false;
+(function detectVolume() {
+  try { audio.volume = 0.3; crossfadeOK = Math.abs(audio.volume - 0.3) < 0.01; audio.volume = 1; }
+  catch (_) { crossfadeOK = false; }
+})();
+let fadeTimer = null;
+let advancing = false;       // 곡 끝 무렵 다음 곡으로 미리 넘어가는 중(중복 방지)
+let enriching = false, enrichStop = false;
+let seeking = false, posTick = 0;
+const LYRIC_LEAD_MS = 400;   // 가사를 살짝 앞당겨 표시(데스크톱과 동일한 체감)
 
 /* ───────────────────── OAuth (GIS) ───────────────────── */
 function waitForGIS() {
@@ -101,10 +122,10 @@ function sendTokenToSW() {
   }).catch(() => {});
 }
 // 태그(메타/커버/USLT)만 파싱하려고 파일 앞부분(ID3v2 영역)만 Range로 받는다.
-async function fetchTagBytes(fileId) {
+async function fetchTagBytes(fileId, lastByte = 1048575) {
   const token = await ensureToken();
   const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`;
-  const r = await fetch(url, { headers: { Authorization: "Bearer " + token, Range: "bytes=0-1048575" }, cache: "no-store" });
+  const r = await fetch(url, { headers: { Authorization: "Bearer " + token, Range: `bytes=0-${lastByte}` }, cache: "no-store" });
   if (!r.ok && r.status !== 206) return null;
   return r.arrayBuffer();
 }
@@ -256,43 +277,170 @@ function parseLRC(text) {
 }
 
 /* ───────────────────── 라이브러리 렌더 ───────────────────── */
+// 정렬 키를 뽑는다. 값이 없으면(예: 아직 태그를 안 읽은 곡의 앨범) 맨 뒤로 보낸다.
+const _SORT_TAIL = "￿";
+function sortKey(t) {
+  if (sortMode === "artist") return (t.artist || _SORT_TAIL);
+  if (sortMode === "album") return (t.album || _SORT_TAIL);
+  if (sortMode === "year") return (t.year || _SORT_TAIL);
+  if (sortMode === "genre") return (t.genre || _SORT_TAIL);
+  return t.title || _SORT_TAIL;
+}
+function sortTracks(arr) {
+  return arr.sort((a, b) =>
+    sortKey(a).localeCompare(sortKey(b), "ko") || (a.title || "").localeCompare(b.title || "", "ko"));
+}
 function applySearch() {
   const q = $("#search").value.trim().toLowerCase();
   filtered = q
-    ? library.filter((t) => (t.title + " " + t.artist + " " + t.name).toLowerCase().includes(q))
+    ? library.filter((t) => (t.title + " " + t.artist + " " + (t.album || "") + " " + t.name).toLowerCase().includes(q))
     : library.slice();
-  renderList();
+  sortTracks(filtered);
+  render();
+  updateEnrichBtn();
 }
-function renderList() {
-  const ul = $("#track-list");
-  if (!filtered.length) {
-    ul.innerHTML = `<li class="entries-empty">${library.length ? "검색 결과가 없습니다." : "곡이 없습니다."}</li>`;
-    return;
-  }
-  ul.innerHTML = filtered.map((t) => {
-    const playing = t.id === library[curIndex]?.id ? " playing" : "";
-    return `<li class="track${playing}" data-id="${t.id}">
+function render() {
+  if (viewMode === "album") renderAlbums();
+  else renderList();
+}
+// 재생 표시/태그 갱신만 반영(스크롤 유지). 전체 재렌더(render)는 innerHTML을 갈아
+// 스크롤이 맨 위로 튀므로, 곡을 누를 때는 이걸 쓴다.
+function refresh() {
+  if (viewMode === "list") renderWindow(true);   // 현재 창만 제자리 갱신
+  // 앨범 보기는 곡별 표시가 없어 다시 그릴 필요 없음
+}
+
+/* ── 목록(가상화) ──
+   2200곡을 전부 DOM에 넣으면 폰 메모리·스크롤이 무겁다. 보이는 구간만 실제로 그린다. */
+const V_ROW = 62;      // 행 높이(px, .track 기준). 첫 렌더 후 실측값으로 보정.
+const V_BUFFER = 6;    // 화면 위아래로 미리 그려둘 행 수
+let vRowH = V_ROW, vStart = -1, vEnd = -1;
+function rowHtml(t) {
+  const playing = t.id === library[curIndex]?.id ? " playing" : "";
+  return `<div class="track${playing}" data-id="${t.id}">
       <div class="track-thumb">♪</div>
       <div class="track-body">
         <div class="track-title">${escapeHtml(t.title)}</div>
         <div class="track-artist">${escapeHtml(t.artist || "알 수 없는 아티스트")}</div>
       </div>
       <button class="track-add" data-add="${t.id}">＋</button>
-    </li>`;
+    </div>`;
+}
+function renderList() {
+  const box = $("#track-list");
+  box.classList.remove("album-mode");
+  if (!filtered.length) {
+    box.innerHTML = `<div class="entries-empty">${library.length ? "검색 결과가 없습니다." : "곡이 없습니다."}</div>`;
+    return;
+  }
+  box.innerHTML = `<div class="vlist"><div class="vlist-inner"></div></div>`;
+  vStart = vEnd = -1;
+  renderWindow(true);
+}
+function renderWindow(force) {
+  if (viewMode !== "list") return;
+  const box = $("#track-list");
+  const vlist = box.querySelector(".vlist");
+  const inner = box.querySelector(".vlist-inner");
+  if (!vlist || !inner) return;
+  vlist.style.height = filtered.length * vRowH + "px";
+  const top = box.scrollTop;
+  const viewH = box.clientHeight || 500;
+  const start = Math.max(0, Math.floor(top / vRowH) - V_BUFFER);
+  const end = Math.min(filtered.length, Math.ceil((top + viewH) / vRowH) + V_BUFFER);
+  if (!force && start === vStart && end === vEnd) return;
+  inner.style.transform = `translateY(${start * vRowH}px)`;
+  inner.innerHTML = filtered.slice(start, end).map(rowHtml).join("");
+  vStart = start; vEnd = end;
+  // 실제 행 높이를 한 번 재서 보정(폰 글꼴/배율에 따라 달라짐).
+  if (force) {
+    const first = inner.querySelector(".track");
+    if (first) {
+      const h = first.getBoundingClientRect().height;
+      if (h > 10 && Math.abs(h - vRowH) > 0.5) { vRowH = h; renderWindow(true); }
+    }
+  }
+}
+
+/* ── 앨범 그리드 ──
+   앨범 태그로 묶는다. 아직 태그를 안 읽은 곡은 앨범이 비어 "(앨범 미확인)"에 모인다.
+   상단 '곡 정보 읽기'로 채울 수 있다(아래 enrichAll). */
+function renderAlbums() {
+  const box = $("#track-list");
+  box.classList.add("album-mode");
+  if (!filtered.length) {
+    box.innerHTML = `<div class="entries-empty">${library.length ? "검색 결과가 없습니다." : "곡이 없습니다."}</div>`;
+    return;
+  }
+  const groups = new Map();
+  for (const t of filtered) {
+    const key = t.album || "(앨범 미확인)";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(t);
+  }
+  const cards = [...groups.entries()].map(([album, ts]) => {
+    const ids = ts.map((t) => t.id).join(",");
+    return `<div class="album-card" data-ids="${ids}">
+      <div class="album-art">♪</div>
+      <div class="album-cap">
+        <div class="album-name">${escapeHtml(album)}</div>
+        <div class="album-artist">${escapeHtml(ts[0].artist || "")} · ${ts.length}곡</div>
+      </div>
+    </div>`;
   }).join("");
+  box.innerHTML = `<div class="album-grid">${cards}</div>`;
 }
 
 /* ───────────────────── 재생 ───────────────────── */
-async function playByLibIndex(i) {
+function driveUrl(id) { return `https://www.googleapis.com/drive/v3/files/${id}?alt=media&supportsAllDrives=true`; }
+function clearFade() { if (fadeTimer) { clearInterval(fadeTimer); fadeTimer = null; } }
+
+// 새 곡을 재생한다. crossfade=true이고 현재 곡이 재생 중이면 대기 요소에 새 곡을
+// 올려 볼륨을 교차시키고, 끝나면 역할을 바꾼다. iOS(볼륨 읽기전용) 등에서는 즉시 전환.
+function startPlayback(url, crossfade) {
+  clearFade();
+  const canCross = crossfade && crossfadeOK && !audio.paused && audio.currentTime > 0
+    && audio.src && audio.src !== url;
+  if (canCross) {
+    const outgoing = audio, incoming = spare;
+    try { incoming.volume = 0; } catch (_) {}
+    incoming.src = url;
+    try { incoming.currentTime = 0; } catch (_) {}
+    audio = incoming; spare = outgoing;   // 새 요소를 '활성'으로 → 이벤트가 새 곡에 귀속
+    incoming.play().catch(() => {});
+    let t = 0;
+    fadeTimer = setInterval(() => {
+      t += FADE_STEP_MS;
+      const r = Math.min(1, t / CROSSFADE_MS);
+      try { incoming.volume = r; } catch (_) {}
+      try { outgoing.volume = 1 - r; } catch (_) {}
+      if (r >= 1) {
+        clearFade();
+        outgoing.pause();
+        try { outgoing.currentTime = 0; outgoing.volume = 1; } catch (_) {}
+        outgoing.removeAttribute("src"); try { outgoing.load(); } catch (_) {}
+      }
+    }, FADE_STEP_MS);
+  } else {
+    try { spare.pause(); spare.removeAttribute("src"); } catch (_) {}
+    try { audio.volume = 1; } catch (_) {}
+    audio.src = url;
+    audio.play().catch(() => {});
+  }
+}
+
+async function playByLibIndex(i, opts = {}) {
   if (i < 0 || i >= library.length) return;
+  advancing = false;                 // 자동 크로스페이드 예약 해제(새 곡 시작)
   curIndex = i;
   const track = library[i];
   $("#mini").hidden = false;
-  setNowPlaying({ title: track.title, artist: track.artist, album: "", cover: null });
-  updateMediaSession(track.title, track.artist, "", null);   // 잠금화면에 즉시 표시(태그 전)
+  setNowPlaying({ title: track.title, artist: track.artist, album: track.album || "",
+                  year: track.year, genre: track.genre, cover: null });
+  updateMediaSession(track.title, track.artist, track.album || "", null);   // 잠금화면 즉시(태그 전)
   $("#mini-play").textContent = "…"; $("#btn-play").textContent = "…";
   lyrics = null; curLyricLine = -1;
-  renderList();
+  refresh();
   $("#lyrics").innerHTML = `<div class="spinner"></div>`;
 
   try {
@@ -300,33 +448,36 @@ async function playByLibIndex(i) {
     sendTokenToSW();   // <audio> 요청 전에 SW가 토큰을 갖고 있도록
     // 스트리밍 재생 — SW가 Authorization을 주입하므로 Drive URL을 직접 <audio>에.
     if (curObjectUrl) { URL.revokeObjectURL(curObjectUrl); curObjectUrl = null; }
-    audio.src = `https://www.googleapis.com/drive/v3/files/${track.id}?alt=media&supportsAllDrives=true`;
-    audio.play().catch(() => {});
+    startPlayback(driveUrl(track.id), opts.crossfade !== false);
     // 메타/커버/가사 — 파일 앞부분(태그)만 받아 파싱(전체 다운로드 없음).
     const buf = await fetchTagBytes(track.id);
     if (i !== curIndex) return;   // 그새 다른 곡으로 넘어갔으면 무시
     if (buf) {
       const m = parseID3(buf);
       const title = m.title || track.title, artist = m.artist || track.artist;
-      library[i].title = title; library[i].artist = artist;
+      track.title = title; track.artist = artist;
+      track.album = m.album || ""; track.year = m.year || ""; track.genre = m.genre || "";
+      track.enriched = true;
+      persistLibrary();               // 읽은 태그를 캐시에 저장(다음엔 앨범/정렬에 바로 반영)
       if (curCoverUrl) { URL.revokeObjectURL(curCoverUrl); curCoverUrl = null; }
       if (m.cover) curCoverUrl = URL.createObjectURL(new Blob([m.cover.data], { type: m.cover.mime }));
-      setNowPlaying({ title, artist, album: m.album, cover: curCoverUrl });
+      setNowPlaying({ title, artist, album: m.album, year: m.year, genre: m.genre, cover: curCoverUrl });
       setLyrics(m.uslt);
       updateMediaSession(title, artist, m.album, curCoverUrl);
-      renderList();
+      refresh();
     }
   } catch (e) {
     toast("재생 실패: " + e.message);
     $("#mini-play").textContent = "▶"; $("#btn-play").textContent = "▶";
   }
 }
-function setNowPlaying({ title, artist, album, cover }) {
+function setNowPlaying({ title, artist, album, year, genre, cover }) {
   $("#mini-title").textContent = title || "—";
   $("#mini-artist").textContent = artist || "";
   $("#np-title").textContent = title || "—";
   $("#np-artist").textContent = artist || "";
-  $("#np-album").textContent = [album, ""].filter(Boolean).join("");
+  $("#np-album").textContent = album || "";
+  $("#np-extra").textContent = [year, genre].filter(Boolean).join(" · ");
   const art = cover || "";
   $("#mini-art").src = art; $("#cover").src = art;
   $("#mini-art").style.visibility = art ? "visible" : "hidden";
@@ -347,7 +498,7 @@ function setLyrics(uslt) {
 }
 function syncLyrics() {
   if (!Array.isArray(lyrics)) return;
-  const at = audio.currentTime * 1000 + 250;   // 살짝 앞당김
+  const at = audio.currentTime * 1000 + LYRIC_LEAD_MS;   // 살짝 앞당김
   let idx = -1;
   for (let i = 0; i < lyrics.length; i++) { if (lyrics[i].t <= at) idx = i; else break; }
   if (idx === curLyricLine) return;
@@ -376,11 +527,16 @@ function prevTrack() {
 }
 function togglePlay() {
   if (curIndex < 0 && library.length) return playByLibIndex(0);
-  if (audio.paused) audio.play(); else audio.pause();
+  if (audio.paused) { audio.play(); return; }
+  // 페이드 도중 일시정지: 페이드를 즉시 끝내고(활성 요소만 남김) 멈춘다.
+  if (fadeTimer) { clearFade(); try { spare.pause(); spare.removeAttribute("src"); audio.volume = 1; } catch (_) {} }
+  audio.pause();
 }
 // 완전 정지(미디어 알림을 밀어 없앨 때 호출됨) — 재생 멈추고 잠금화면 세션 제거.
 function stopPlayback() {
+  clearFade();
   audio.pause();
+  try { spare.pause(); spare.removeAttribute("src"); audio.volume = 1; } catch (_) {}
   try { audio.currentTime = 0; } catch (_) {}
   if ("mediaSession" in navigator) {
     navigator.mediaSession.playbackState = "none";
@@ -483,6 +639,57 @@ function switchTab(tab) {
   if (tab === "playlists") renderPlaylists();
 }
 
+/* ───────────────────── 태그 캐시 / 일괄 읽기 ───────────────────── */
+let saveTimer = null;
+function persistLibrary() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => { try { LS.set("lib_cache", library); } catch (_) {} }, 600);
+}
+// 앨범/연도/장르는 파일 태그에만 있어, 재생하지 않은 곡은 비어 있다. 원할 때
+// 곡마다 태그 앞부분(커버 제외, ~96KB)만 받아 채운다. 결과는 영구 캐시.
+async function enrichAll() {
+  if (enriching) { enrichStop = true; return; }
+  const todo = library.filter((t) => !t.enriched);
+  if (!todo.length) return toast("이미 모든 곡 정보를 읽었습니다.");
+  const est = Math.max(1, Math.round(todo.length * 96 / 1024));
+  if (!confirm(`${todo.length}곡의 앨범·연도·장르를 읽습니다.\n대략 ${est}MB를 한 번만 받아 저장합니다(커버 제외).\n계속할까요?`)) return;
+  enriching = true; enrichStop = false;
+  updateEnrichBtn();
+  const status = $("#lib-status");
+  const queue = todo.slice();
+  let done = 0;
+  async function worker() {
+    while (queue.length && !enrichStop) {
+      const t = queue.shift();
+      try {
+        const buf = await fetchTagBytes(t.id, 98303);   // 96KB — 텍스트 프레임엔 충분
+        if (buf) {
+          const m = parseID3(buf);
+          if (m.title) t.title = m.title;
+          if (m.artist) t.artist = m.artist;
+          t.album = m.album || ""; t.year = m.year || ""; t.genre = m.genre || "";
+        }
+      } catch (_) {}
+      t.enriched = true; done++;
+      if (done % 10 === 0) { status.textContent = `곡 정보 읽는 중… ${done}/${todo.length} (탭하면 중단)`; persistLibrary(); }
+    }
+  }
+  await Promise.all(Array.from({ length: 4 }, worker));
+  enriching = false; persistLibrary();
+  status.textContent = `${library.length}곡` + (enrichStop ? " · 중단됨(나머지는 다시 읽기 가능)" : "");
+  updateEnrichBtn();
+  applySearch();
+}
+// 앨범 보기/태그 정렬을 볼 때, 아직 안 읽은 곡이 있으면 '곡 정보 읽기' 버튼을 띄운다.
+function updateEnrichBtn() {
+  const btn = $("#btn-enrich");
+  if (!btn) return;
+  const tagView = viewMode === "album" || sortMode === "album" || sortMode === "year" || sortMode === "genre";
+  const pending = library.some((t) => !t.enriched);
+  btn.textContent = enriching ? "읽는 중… (중단)" : "곡 정보 읽기";
+  btn.hidden = !(tagView && pending);
+}
+
 /* ───────────────────── 라이브러리 로딩 ───────────────────── */
 async function loadLibrary(forceRefresh) {
   const status = $("#lib-status");
@@ -564,10 +771,34 @@ function bind() {
   $("#btn-signout").addEventListener("click", signOut);
   $("#search").addEventListener("input", applySearch);
 
-  // 트랙 목록: 재생 / 담기
+  // 정렬 / 보기 전환 / 곡 정보 읽기
+  const sortSel = $("#sort-mode");
+  sortSel.value = sortMode;
+  sortSel.addEventListener("change", () => {
+    sortMode = sortSel.value; LS.set("sort_mode", sortMode); applySearch();
+  });
+  $$(".vt-btn").forEach((b) => b.addEventListener("click", () => {
+    viewMode = b.dataset.viewMode;
+    $$(".vt-btn").forEach((x) => x.classList.toggle("active", x === b));
+    applySearch();
+  }));
+  $("#btn-enrich").addEventListener("click", enrichAll);
+
+  // 목록 가상화: 스크롤하면 보이는 구간만 다시 그린다.
+  $("#track-list").addEventListener("scroll", () => renderWindow(false), { passive: true });
+  window.addEventListener("resize", () => renderWindow(true));
+
+  // 트랙 목록 / 앨범 카드: 재생 / 담기
   $("#track-list").addEventListener("click", (e) => {
     const add = e.target.closest("[data-add]");
     if (add) { e.stopPropagation(); const t = library.find((x) => x.id === add.dataset.add); if (t) { curIndex = library.indexOf(t); addCurrentToPlaylist(); } return; }
+    const card = e.target.closest(".album-card");
+    if (card) {
+      const firstId = card.dataset.ids.split(",")[0];
+      playByLibIndex(library.findIndex((t) => t.id === firstId));
+      openPlayer();
+      return;
+    }
     const li = e.target.closest(".track"); if (!li) return;
     playByLibIndex(library.findIndex((t) => t.id === li.dataset.id));
     openPlayer();
@@ -632,29 +863,46 @@ function bind() {
   $("#btn-shuffle").classList.add("dim"); $("#btn-repeat").classList.add("dim");
 
   // 시크바
-  const seek = $("#seek"); let seeking = false;
+  const seek = $("#seek");
   seek.addEventListener("input", () => { seeking = true; $("#cur-time").textContent = fmtTime((seek.value / 1000) * (audio.duration || 0)); });
   seek.addEventListener("change", () => { if (audio.duration) audio.currentTime = (seek.value / 1000) * audio.duration; seeking = false; });
 
-  // 오디오 이벤트
-  audio.addEventListener("play", () => {
+  // 오디오 이벤트 — 크로스페이드용으로 요소가 2개라, 둘 다에 붙이고
+  // '활성' 요소(audio)의 이벤트만 UI에 반영한다. 페이드 중 물러나는 요소가
+  // 내는 pause/timeupdate는 무시된다.
+  bindAudioEvents(audio);
+  bindAudioEvents(spare);
+}
+
+function bindAudioEvents(el) {
+  el.addEventListener("play", function () {
+    if (this !== audio) return;
     $("#mini-play").textContent = "❚❚"; $("#btn-play").textContent = "❚❚";
     if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
     updatePositionState();
   });
-  audio.addEventListener("pause", () => {
+  el.addEventListener("pause", function () {
+    if (this !== audio) return;
     $("#mini-play").textContent = "▶"; $("#btn-play").textContent = "▶";
     if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
   });
-  audio.addEventListener("ended", () => nextTrack(true));
-  audio.addEventListener("loadedmetadata", updatePositionState);
-  let posTick = 0;
-  audio.addEventListener("timeupdate", () => {
+  el.addEventListener("ended", function () { if (this === audio) nextTrack(true); });
+  el.addEventListener("loadedmetadata", function () { if (this === audio) updatePositionState(); });
+  el.addEventListener("timeupdate", function () {
+    if (this !== audio) return;
+    const seek = $("#seek");
     const d = audio.duration || 0, c = audio.currentTime || 0;
     if (!seeking && d) { seek.value = Math.round((c / d) * 1000); $("#cur-time").textContent = fmtTime(c); }
     $("#dur-time").textContent = fmtTime(d);
     $("#mini-prog").firstElementChild.style.width = d ? (c / d * 100) + "%" : "0";
     if (++posTick % 8 === 0) updatePositionState();   // 약 2초마다 잠금화면 진행바 갱신
+    // 곡 끝 CROSSFADE_MS 전에 다음 곡으로 미리 넘어가 겹치게 한다(AIMP식).
+    // 볼륨 조절이 되는 기기에서만(iOS는 즉시 전환). repeat one은 제외.
+    if (crossfadeOK && !advancing && repeat !== "one" && d && c > 1
+        && (d - c) <= CROSSFADE_MS / 1000) {
+      advancing = true;
+      nextTrack(true);
+    }
     syncLyrics();
   });
 }

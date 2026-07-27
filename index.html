@@ -67,8 +67,22 @@
     <div class="searchbar">
       <input id="search" type="search" placeholder="곡·아티스트·앨범 검색" autocomplete="off">
     </div>
+    <div class="libbar">
+      <select id="sort-mode" class="libbar-sel" title="정렬">
+        <option value="title">제목순</option>
+        <option value="artist">아티스트순</option>
+        <option value="album">앨범순</option>
+        <option value="year">연도순</option>
+        <option value="genre">장르순</option>
+      </select>
+      <button id="btn-enrich" class="libbar-enrich" hidden>곡 정보 읽기</button>
+      <div class="viewtoggle">
+        <button class="vt-btn active" data-view-mode="list">곡</button>
+        <button class="vt-btn" data-view-mode="album">앨범</button>
+      </div>
+    </div>
     <div id="lib-status" class="lib-status"></div>
-    <ul id="track-list" class="track-list"></ul>
+    <div id="track-list" class="track-list"></div>
   </div>
 
   <!-- 플레이리스트 탭 -->
@@ -116,6 +130,7 @@
       <div id="np-title" class="np-title">—</div>
       <div id="np-artist" class="np-artist"></div>
       <div id="np-album" class="np-album"></div>
+      <div id="np-extra" class="np-extra"></div>
     </div>
   </div>
 

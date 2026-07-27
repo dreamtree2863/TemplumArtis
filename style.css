@@ -55,10 +55,25 @@ img{display:block}
   background:var(--panel);font-size:15px;color:var(--ink)}
 .lib-status{padding:2px 16px 6px;font-size:12px;color:var(--muted)}
 
-.track-list{list-style:none;margin:0;padding:0 8px 150px;overflow-y:auto;flex:1;
-  -webkit-overflow-scrolling:touch}
-.track{display:flex;align-items:center;gap:12px;padding:11px 10px;border-radius:12px;
-  content-visibility:auto;contain-intrinsic-size:auto 62px}
+/* 정렬 / 보기 전환 바 */
+.libbar{display:flex;align-items:center;gap:8px;padding:0 14px 6px}
+.libbar-sel{flex:none;padding:8px 10px;border-radius:10px;border:1px solid var(--line);
+  background:var(--panel);color:var(--ink);font-family:inherit;font-size:13px}
+.libbar-enrich{margin-left:auto;padding:8px 11px;border-radius:10px;border:1px solid var(--accent);
+  background:var(--accent-soft);color:var(--accent-dark);font-size:12.5px;font-weight:600}
+.libbar-enrich[hidden]{display:none}
+.libbar-enrich + .viewtoggle{margin-left:8px}
+.viewtoggle{margin-left:auto;display:flex;background:var(--panel);border:1px solid var(--line);
+  border-radius:10px;overflow:hidden}
+.vt-btn{padding:8px 14px;font-size:13px;color:var(--muted)}
+.vt-btn.active{background:var(--accent);color:#fff;font-weight:700}
+
+.track-list{margin:0;padding:0 8px 150px;overflow-y:auto;flex:1;
+  -webkit-overflow-scrolling:touch;position:relative}
+/* 가상 목록: 전체 높이만큼 자리를 잡고(vlist), 보이는 구간만 실제 DOM으로 그린다(vlist-inner). */
+.vlist{position:relative}
+.vlist-inner{position:absolute;left:0;right:0;top:0}
+.track{display:flex;align-items:center;gap:12px;padding:11px 10px;border-radius:12px}
 .track:active{background:var(--accent-soft)}
 .track.playing{background:var(--accent-soft)}
 .track-thumb{width:44px;height:44px;border-radius:9px;background:var(--accent-soft);
@@ -69,6 +84,17 @@ img{display:block}
 .track.playing .track-title{color:var(--accent-dark)}
 .track-artist{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .track-add{width:34px;height:34px;flex:none;color:var(--faint);font-size:20px}
+
+/* 앨범 그리드 보기 */
+.album-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;padding:6px 10px 150px}
+.album-card{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.album-card:active{background:var(--accent-soft)}
+.album-art{aspect-ratio:1;background:var(--accent-soft);color:var(--accent);
+  display:grid;place-items:center;font-size:30px;overflow:hidden}
+.album-art img{width:100%;height:100%;object-fit:cover}
+.album-cap{padding:9px 11px 11px}
+.album-name{font-size:13.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.album-artist{font-size:11.5px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
 /* 플레이리스트 */
 .pl-head{display:flex;align-items:center;justify-content:space-between;padding:14px 18px 6px}
@@ -121,6 +147,7 @@ img{display:block}
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .np-artist{font-size:16px;color:var(--dark-muted);margin-top:4px}
 .np-album{font-size:13px;color:#8c8172;margin-top:6px}
+.np-extra{font-size:12px;color:#6f6558;margin-top:4px}
 
 /* 가사 */
 .ppanel[data-ppanel="lyrics"]{padding:0}
