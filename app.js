@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v12";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v13";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -69,6 +69,10 @@ let audio = $("#audio");
 let spare = document.createElement("audio");
 spare.preload = "auto";
 document.body.appendChild(spare);
+// Web Audio(공간감 효과)로 태우려면 스트림이 CORS로 받아져야 무음이 안 된다.
+// SW가 이미 mode:"cors"로 Drive를 받아 정상 재생 중이므로 crossOrigin을 붙여도 안전하다.
+audio.crossOrigin = "anonymous";
+spare.crossOrigin = "anonymous";
 // iOS Safari는 audio.volume이 읽기 전용(하드웨어 볼륨만) → 크로스페이드 불가.
 // 값을 넣어보고 반영되는지로 판별하고, 안 되면 즉시 전환으로 폴백한다.
 let crossfadeOK = false;
@@ -506,10 +510,79 @@ function startPlayback(url, crossfade) {
   }
 }
 
+/* ───────────────────── 공간감/울림 효과 (Web Audio) ─────────────────────
+   갤럭시 내장 Dolby Atmos는 OS가 출력 전체에 거는 것이라 앱이 못 켠다. 이건 그와
+   별개로, 앱이 <audio> 출력을 Web Audio 그래프에 태워 리버브(울림)+스테레오 확장을
+   직접 거는 효과다. 두 오디오 요소(크로스페이드용) 모두 한 그래프에 물린다.
+   기본 꺼짐. 켤 때만 그래프를 만든다(안 켜면 기존 재생 경로를 전혀 안 건드림). */
+let actx = null, spDry = null, spWet = null, spConv = null, spPre = null, spaceReady = false, spaceApplied = false;
+const spaceSources = new WeakMap();
+const SPACE_PRESETS = {
+  off:  { dry: 1.0, wet: 0.0, pre: 0.0, ir: null },
+  soft: { dry: 0.92, wet: 0.16, pre: 0.02, ir: [2.0, 2.4] },
+  wide: { dry: 0.85, wet: 0.32, pre: 0.03, ir: [2.6, 1.8] },
+};
+// 감쇠하는 스테레오 노이즈로 임펄스 응답을 만든다(외부 파일 없이 — CSP 안전).
+// 좌/우를 독립 난수로 채워 스테레오 폭까지 넓어진다.
+function makeIR(seconds, decay) {
+  const rate = actx.sampleRate, len = Math.max(1, (seconds * rate) | 0);
+  const buf = actx.createBuffer(2, len, rate);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = buf.getChannelData(ch);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
+  }
+  return buf;
+}
+function routeSpace(el) {
+  if (!actx || spaceSources.has(el)) return;
+  try {
+    const s = actx.createMediaElementSource(el);
+    s.connect(spDry); s.connect(spPre);
+    spaceSources.set(el, s);
+  } catch (_) { /* 이미 연결됐거나 실패 — 무시 */ }
+}
+function ensureSpaceGraph() {
+  if (spaceReady) return true;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return false;
+    actx = new AC();
+    spDry = actx.createGain(); spWet = actx.createGain();
+    spConv = actx.createConvolver(); spPre = actx.createDelay(0.2);
+    spConv.buffer = makeIR(2.2, 2.0);
+    spPre.connect(spConv); spConv.connect(spWet);
+    spDry.connect(actx.destination); spWet.connect(actx.destination);
+    routeSpace(audio); routeSpace(spare);   // 두 요소(크로스페이드) 모두 물린다
+    spaceReady = true;
+    return true;
+  } catch (_) { spaceReady = false; return false; }
+}
+function reflectSpaceUI(mode) {
+  document.querySelectorAll("#fxrow .fx-btn").forEach((b) =>
+    b.classList.toggle("active", b.dataset.fx === mode));
+}
+function applySpace(mode, save) {
+  if (!SPACE_PRESETS[mode]) mode = "off";
+  if (save !== false) LS.set("space_fx", mode);
+  reflectSpaceUI(mode);
+  if (mode === "off") {
+    if (spaceReady) { spDry.gain.value = 1; spWet.gain.value = 0; }   // 그래프는 둔 채 통과만
+    return;
+  }
+  if (!ensureSpaceGraph()) { toast("이 기기에선 공간감 효과를 쓸 수 없어요."); LS.set("space_fx", "off"); reflectSpaceUI("off"); return; }
+  if (actx.state === "suspended") actx.resume().catch(() => {});
+  const p = SPACE_PRESETS[mode];
+  if (p.ir) spConv.buffer = makeIR(p.ir[0], p.ir[1]);
+  spPre.delayTime.value = p.pre;
+  spDry.gain.value = p.dry; spWet.gain.value = p.wet;
+}
+
 async function playByLibIndex(i, opts = {}) {
   if (i < 0 || i >= library.length) return;
   advancing = false;                 // 자동 크로스페이드 예약 해제(새 곡 시작)
   curIndex = i;
+  // 저장된 공간감 설정을 첫 재생(=사용자 제스처) 때 한 번 실제로 건다.
+  if (!spaceApplied) { spaceApplied = true; const m = LS.get("space_fx", "off"); if (m !== "off") applySpace(m, false); }
   const track = library[i];
   $("#mini").hidden = false;
   // 정보는 태그에서 온 것만 보여준다. 아직 태그를 안 읽은 곡이면 추정값(파일명)을
@@ -1195,6 +1268,14 @@ function bind() {
     e.currentTarget.classList.toggle("dim", repeat === "off");
   });
   $("#btn-shuffle").classList.add("dim"); $("#btn-repeat").classList.add("dim");
+
+  // 공간감/울림 효과 — 클릭은 사용자 제스처라 AudioContext resume이 허용된다.
+  const fxrow = $("#fxrow");
+  if (fxrow) fxrow.addEventListener("click", (e) => {
+    const b = e.target.closest(".fx-btn"); if (!b) return;
+    applySpace(b.dataset.fx, true);
+  });
+  reflectSpaceUI(LS.get("space_fx", "off"));   // 저장된 설정 표시(그래프는 첫 재생/토글 때 생성)
 
   // 시크바
   const seek = $("#seek");
