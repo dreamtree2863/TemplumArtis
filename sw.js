@@ -3,8 +3,9 @@
    · Drive 오디오(alt=media): <audio>가 직접 스트리밍. SW가 Authorization 헤더를
      주입하고 Range 요청을 그대로 전달(206) → 통째 다운로드 없이 즉시 재생/탐색.
    (스트리밍 인증 주입 기법은 Templum Sapientiae Mobile PWA에서 검증된 방식.) */
-const CACHE = "ta-music-v10";
+const CACHE = "ta-music-v11";
 const AUTH_CACHE = "ta-auth";   // Drive 토큰 보관(SW 재시작 후에도 읽기 위함)
+const COVER_CACHE = "ta-covers";   // 추출한 앨범 커버(재생 시 즉시 표시). 갱신 때 지우지 않는다.
 const SHELL = [
   "./", "./index.html", "./style.css", "./app.js",
   "./manifest.webmanifest", "./icon.svg", "./icon-192.png", "./icon-512.png",
@@ -19,7 +20,7 @@ self.addEventListener("install", (e) => {
 self.addEventListener("activate", (e) => {
   e.waitUntil(
     caches.keys().then((keys) => Promise.all(
-      keys.filter((k) => k !== CACHE && k !== AUTH_CACHE).map((k) => caches.delete(k))
+      keys.filter((k) => k !== CACHE && k !== AUTH_CACHE && k !== COVER_CACHE).map((k) => caches.delete(k))
     )).then(() => self.clients.claim())
   );
 });

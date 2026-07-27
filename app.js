@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v10";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v11";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -51,6 +51,7 @@ let library = [];            // [{id, name, title, artist, size, album, year, ge
 let filtered = [];
 let curIndex = -1;
 let curObjectUrl = null;
+let shownCoverForId = null;   // 지금 커버가 표시된 곡 id(캐시/태그 중복 표시 방지)
 let shuffle = false, repeat = "off";  // off|all|one
 let lyrics = null;           // [{t, text}] | {plain}
 let curLyricLine = -1;
@@ -150,6 +151,45 @@ async function fetchTagBytes(fileId, lastByte = 1048575) {
   if (!r.ok && r.status !== 206) return null;
   return r.arrayBuffer();
 }
+// 커버 포함 태그를 '딱 필요한 만큼만' 받는다. 헤더 16KB를 먼저 읽어 ID3 태그 전체
+// 크기를 알아낸 뒤 그만큼만 받아, 1MB 고정 다운로드를 없앤다(커버 없는 곡은 16KB로 끝).
+async function fetchTagExact(fileId) {
+  const head = await fetchTagBytes(fileId, 16383);   // 16KB
+  if (!head) return null;
+  const v = new Uint8Array(head);
+  if (v.length < 10 || v[0] !== 0x49 || v[1] !== 0x44 || v[2] !== 0x33) return head; // ID3 아님
+  const size = ((v[6] & 0x7f) << 21) | ((v[7] & 0x7f) << 14) | ((v[8] & 0x7f) << 7) | (v[9] & 0x7f);
+  const end = 10 + size;                              // 태그 전체 끝(APIC 포함)
+  if (end <= v.length) return head;                  // 이미 16KB 안에 다 들어옴
+  return fetchTagBytes(fileId, Math.min(end, 4 * 1024 * 1024) - 1);   // 안전 상한 4MB
+}
+
+/* ── 커버 영구 캐시 (Cache API, 파일ID:크기 키) ──
+   한 번 추출한 커버를 로컬에 저장해 재생 시 즉시 표시(재다운로드 없음).
+   키에 파일 크기를 넣어, 파일이 바뀌면(재태깅) 자동으로 새로 받는다. LRU로 개수 제한. */
+const COVER_CACHE = "ta-covers";
+const COVER_KEYS = "cover_keys";
+const COVER_MAX = 200;
+function coverKey(t) { return `cover/${t.id}:${t.size || 0}`; }
+async function getCachedCover(t) {
+  try {
+    const c = await caches.open(COVER_CACHE);
+    const r = await c.match(coverKey(t));
+    if (!r) return null;
+    return URL.createObjectURL(await r.blob());
+  } catch (_) { return null; }
+}
+async function putCachedCover(t, bytes, mime) {
+  try {
+    const c = await caches.open(COVER_CACHE);
+    const key = coverKey(t);
+    await c.put(key, new Response(new Blob([bytes], { type: mime || "image/jpeg" })));
+    let keys = LS.get(COVER_KEYS, []).filter((k) => k !== key);
+    keys.push(key);
+    while (keys.length > COVER_MAX) { const old = keys.shift(); c.delete(old).catch(() => {}); }
+    LS.set(COVER_KEYS, keys);
+  } catch (_) {}
+}
 
 /* ───────────────────── Drive API ───────────────────── */
 async function driveFetch(url, asBlob) {
@@ -170,9 +210,12 @@ function isAudioFile(f) {
 function toTrack(f) {
   const stem = f.name.replace(/\.[^.]+$/, "");
   const dash = stem.indexOf(" - ");
+  // 파일 태그를 읽기 전의 '임시 추정'일 뿐이다. 실제 표시는 태그(TIT2/TPE1)를 우선하며,
+  // 태그가 없을 때만 이 값이 남는다. 파일명 규칙은 "아티스트 - 제목"(데스크톱 저장 형식).
   return { id: f.id, name: f.name, size: +f.size || 0,
-    title: dash > 0 ? stem.slice(0, dash) : stem,
-    artist: dash > 0 ? stem.slice(dash + 3) : "" };
+    artist: dash > 0 ? stem.slice(0, dash) : "",
+    title: dash > 0 ? stem.slice(dash + 3) : stem,
+    guessed: true };   // 아직 태그 미확인(추정값)
 }
 // 저장된 음악 폴더 경로 목록(My Drive 기준). 기본은 데스크톱 라이브러리 폴더.
 function getFolderPaths() {
@@ -373,6 +416,8 @@ function renderWindow(force) {
   inner.style.transform = `translateY(${start * vRowH}px)`;
   inner.innerHTML = filtered.slice(start, end).map(rowHtml).join("");
   vStart = start; vEnd = end;
+  // 보이는 곡의 실제 태그를 읽어 채운다(태그 우선, 없으면 파일명 추정 유지).
+  for (const t of filtered.slice(start, end)) queueEnrich(t);
   // 실제 행 높이를 한 번 재서 보정(폰 글꼴/배율에 따라 달라짐).
   if (force) {
     const first = inner.querySelector(".track");
@@ -456,13 +501,34 @@ async function playByLibIndex(i, opts = {}) {
   curIndex = i;
   const track = library[i];
   $("#mini").hidden = false;
-  setNowPlaying({ title: track.title, artist: track.artist, album: track.album || "",
-                  year: track.year, genre: track.genre, cover: null });
-  updateMediaSession(track.title, track.artist, track.album || "", null);   // 잠금화면 즉시(태그 전)
+  // 정보는 태그에서 온 것만 보여준다. 아직 태그를 안 읽은 곡이면 추정값(파일명)을
+  // 띄우지 않고 '불러오는 중'으로 두었다가, 아래에서 태그를 읽어 채운다.
+  // (목록에서 보이던 곡은 이미 태그를 읽어둬서 known=true → 즉시 정확히 표시)
+  const known = !!track.enriched;
+  if (curCoverUrl) { URL.revokeObjectURL(curCoverUrl); curCoverUrl = null; }
+  shownCoverForId = null;
+  setNowPlaying({
+    title: known ? track.title : "불러오는 중…",
+    artist: known ? track.artist : "",
+    album: known ? (track.album || "") : "",
+    year: known ? track.year : "", genre: known ? track.genre : "",
+    cover: null,
+  });
+  updateMediaSession(known ? track.title : (track.title || ""),
+                     known ? track.artist : "", known ? (track.album || "") : "", null);
   $("#mini-play").textContent = "…"; $("#btn-play").textContent = "…";
   lyrics = null; curLyricLine = -1;
   refresh();
   $("#lyrics").innerHTML = `<div class="spinner"></div>`;
+
+  // 캐시된 커버가 있으면 다운로드를 기다리지 않고 즉시 표시(가장 큰 체감 개선).
+  getCachedCover(track).then((url) => {
+    if (!url) return;
+    if (i !== curIndex || shownCoverForId === track.id) { URL.revokeObjectURL(url); return; }
+    if (curCoverUrl) URL.revokeObjectURL(curCoverUrl);
+    curCoverUrl = url; shownCoverForId = track.id;
+    setCoverImg("#cover", url); setCoverImg("#mini-art", url);
+  });
 
   try {
     await ensureToken();
@@ -470,8 +536,8 @@ async function playByLibIndex(i, opts = {}) {
     // 스트리밍 재생 — SW가 Authorization을 주입하므로 Drive URL을 직접 <audio>에.
     if (curObjectUrl) { URL.revokeObjectURL(curObjectUrl); curObjectUrl = null; }
     startPlayback(driveUrl(track.id), opts.crossfade !== false);
-    // 메타/커버/가사 — 파일 앞부분(태그)만 받아 파싱(전체 다운로드 없음).
-    const buf = await fetchTagBytes(track.id);
+    // 메타/커버/가사 — 태그만 '딱 필요한 만큼' 받아 파싱(1MB 고정 아님).
+    const buf = await fetchTagExact(track.id);
     if (i !== curIndex) return;   // 그새 다른 곡으로 넘어갔으면 무시
     if (buf) {
       const m = parseID3(buf);
@@ -480,8 +546,15 @@ async function playByLibIndex(i, opts = {}) {
       track.album = m.album || ""; track.year = m.year || ""; track.genre = m.genre || "";
       track.enriched = true;
       persistLibrary();               // 읽은 태그를 캐시에 저장(다음엔 앨범/정렬에 바로 반영)
-      if (curCoverUrl) { URL.revokeObjectURL(curCoverUrl); curCoverUrl = null; }
-      if (m.cover) curCoverUrl = URL.createObjectURL(new Blob([m.cover.data], { type: m.cover.mime }));
+      if (m.cover) {
+        putCachedCover(track, m.cover.data, m.cover.mime);   // 다음 재생 땐 즉시 표시
+        // 캐시가 이미 이 곡 커버를 띄웠으면 다시 만들지 않는다(깜빡임 방지).
+        if (shownCoverForId !== track.id) {
+          if (curCoverUrl) URL.revokeObjectURL(curCoverUrl);
+          curCoverUrl = URL.createObjectURL(new Blob([m.cover.data], { type: m.cover.mime }));
+          shownCoverForId = track.id;
+        }
+      }
       setNowPlaying({ title, artist, album: m.album, year: m.year, genre: m.genre, cover: curCoverUrl });
       setLyrics(m.uslt);
       updateMediaSession(title, artist, m.album, curCoverUrl);
@@ -499,9 +572,16 @@ function setNowPlaying({ title, artist, album, year, genre, cover }) {
   $("#np-artist").textContent = artist || "";
   $("#np-album").textContent = album || "";
   $("#np-extra").textContent = [year, genre].filter(Boolean).join(" · ");
-  const art = cover || "";
-  $("#mini-art").src = art; $("#cover").src = art;
-  $("#mini-art").style.visibility = art ? "visible" : "hidden";
+  setCoverImg("#cover", cover);
+  setCoverImg("#mini-art", cover);
+}
+// 커버 <img> 설정. 커버가 없으면 src=""를 넣지 않는다 — 빈 src는 '깨진 이미지'
+// 아이콘을 띄우기 때문이다. 대신 src 속성을 지워 CSS 플레이스홀더(♪)가 보이게 한다.
+function setCoverImg(sel, url) {
+  const img = $(sel);
+  if (!img) return;
+  if (url) { img.src = url; img.classList.add("has-art"); }
+  else { img.removeAttribute("src"); img.classList.remove("has-art"); }
 }
 function setLyrics(uslt) {
   const box = $("#lyrics");
@@ -748,11 +828,66 @@ function switchTab(tab) {
   if (tab === "playlists") renderPlaylists();
 }
 
-/* ───────────────────── 태그 캐시 / 일괄 읽기 ───────────────────── */
+/* ───────────────────── 태그 캐시 / 읽기 ───────────────────── */
+// 캐시 버전 — toTrack 추정 방향을 고쳐서, 옛 캐시(제목·아티스트가 뒤바뀐)를 자동 폐기한다.
+const LIB_CACHE_VER = 2;
+function saveLibCache() { try { LS.set("lib_cache", { v: LIB_CACHE_VER, tracks: library }); } catch (_) {} }
+function readLibCache() {
+  const c = LS.get("lib_cache", null);
+  return (c && c.v === LIB_CACHE_VER && Array.isArray(c.tracks)) ? c.tracks : null;
+}
 let saveTimer = null;
 function persistLibrary() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => { try { LS.set("lib_cache", library); } catch (_) {} }, 600);
+  saveTimer = setTimeout(saveLibCache, 600);
+}
+
+// 화면에 보이는 곡의 실제 태그를 읽어 목록/그리드를 채운다. 파일명 추정은 태그가
+// 없거나 아직 안 읽었을 때만 남는 폴백이다. 커버는 제외하고 앞부분(~96KB)만 받아
+// 가볍게, 동시 3개까지만. 결과는 영구 캐시.
+const enrichPending = new Set();   // 대기/진행 중인 곡 id
+let enrichActive = 0;
+const enrichQueue = [];
+const ENRICH_CONC = 3;
+
+function queueEnrich(t) {
+  if (!t || t.enriched || enrichPending.has(t.id)) return;
+  enrichPending.add(t.id);
+  enrichQueue.push(t);
+  pumpEnrich();
+}
+function pumpEnrich() {
+  while (enrichActive < ENRICH_CONC && enrichQueue.length) {
+    const t = enrichQueue.shift();
+    enrichActive++;
+    enrichOne(t).finally(() => {
+      enrichActive--; enrichPending.delete(t.id); pumpEnrich();
+    });
+  }
+}
+async function enrichOne(t) {
+  try {
+    const buf = await fetchTagBytes(t.id, 98303);   // 96KB — 텍스트 프레임엔 충분(커버 제외)
+    if (buf) {
+      const m = parseID3(buf);
+      if (m.title) t.title = m.title;
+      if (m.artist) t.artist = m.artist;
+      t.album = m.album || ""; t.year = m.year || ""; t.genre = m.genre || "";
+      t.guessed = !(m.title || m.artist);   // 태그가 있으면 추정 해제
+    }
+  } catch (_) { return; }   // 실패 시 enriched 표시 안 함 → 다음에 다시 시도
+  t.enriched = true;
+  persistLibrary();
+  updateRowInPlace(t);
+}
+// 이미 화면에 있는 행이면 값만 제자리 갱신(다시 그리지 않아 스크롤·깜빡임 없음).
+function updateRowInPlace(t) {
+  const row = $(`#track-list .track[data-id="${t.id}"]`);
+  if (!row) return;
+  const ti = row.querySelector(".track-title");
+  const ar = row.querySelector(".track-artist");
+  if (ti) ti.textContent = t.title || "";
+  if (ar) ar.textContent = t.artist || "알 수 없는 아티스트";
 }
 // 앨범/연도/장르는 파일 태그에만 있어, 재생하지 않은 곡은 비어 있다. 원할 때
 // 곡마다 태그 앞부분(커버 제외, ~96KB)만 받아 채운다. 결과는 영구 캐시.
@@ -802,7 +937,7 @@ function updateEnrichBtn() {
 /* ───────────────────── 라이브러리 로딩 ───────────────────── */
 async function loadLibrary(forceRefresh) {
   const status = $("#lib-status");
-  const cached = LS.get("lib_cache", null);
+  const cached = readLibCache();
   if (cached && !forceRefresh) {
     library = cached; applySearch();
     status.textContent = `${library.length}곡 (캐시) · ⟳ 로 새로고침`;
@@ -824,7 +959,7 @@ async function loadLibrary(forceRefresh) {
       return;
     }
     library = await listFolderAudio(rootIds, (n) => (status.textContent = `불러오는 중… ${n}곡`));
-    LS.set("lib_cache", library);
+    saveLibCache();
     applySearch();
     status.textContent = `${library.length}곡` + (missing.length ? ` · ⚠️ 못 찾은 폴더: ${missing.join(", ")}` : "");
   } catch (e) {

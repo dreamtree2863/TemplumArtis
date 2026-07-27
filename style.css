@@ -112,6 +112,8 @@ img{display:block}
 .mini{position:absolute;left:8px;right:8px;bottom:calc(var(--safe-bot) + 58px);
   display:flex;align-items:center;gap:11px;padding:9px 12px;background:var(--dark);
   color:var(--dark-ink);border-radius:16px;box-shadow:0 8px 30px rgba(30,20,10,.28);overflow:hidden}
+/* src 없는 <img>는 배경(어두운 사각형)만 보인다 — 깨진 아이콘이 아니다.
+   (의사요소 ::after는 <img>엔 렌더되지 않으므로 배경으로만 처리) */
 .mini-art{width:42px;height:42px;border-radius:9px;flex:none;background:var(--dark-2);object-fit:cover}
 .mini-meta{flex:1;min-width:0}
 .mini-title{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -139,9 +141,15 @@ img{display:block}
 .ptab{padding:7px 16px;border-radius:20px;color:var(--dark-muted);font-size:14px;font-weight:600}
 .ptab.active{background:rgba(255,255,255,.1);color:var(--dark-ink)}
 .ppanel{flex:1;display:flex;flex-direction:column;min-height:0;padding:0 26px}
-.cover-wrap{flex:1;display:grid;place-items:center;padding:18px 0}
-.cover{width:min(78vw,340px);aspect-ratio:1;border-radius:20px;object-fit:cover;
-  background:var(--dark-2);box-shadow:0 20px 60px rgba(0,0,0,.45)}
+.cover-wrap{flex:1;display:grid;place-items:center;padding:18px 0;position:relative}
+/* 커버 로딩 중/없음: 깨진 이미지 대신 ♪ 플레이스홀더를 보여준다 */
+.cover-wrap::before{content:"♪";position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+  font-size:72px;color:#4a4038;z-index:0}
+.cover{position:relative;z-index:1;width:min(78vw,340px);aspect-ratio:1;border-radius:20px;
+  object-fit:cover;background:var(--dark-2);box-shadow:0 20px 60px rgba(0,0,0,.45);
+  transition:opacity .2s}
+/* 커버가 아직 없으면 이미지 사각형을 투명하게 해 뒤의 ♪가 보이게(도착하면 페이드 인) */
+.cover:not(.has-art){opacity:0}
 .np-meta{padding:6px 0 10px;text-align:center}
 .np-title{font-size:22px;font-weight:800;letter-spacing:-.02em;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
