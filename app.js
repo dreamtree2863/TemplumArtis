@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v20";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v21";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -976,6 +976,20 @@ async function syncPlaylists() {
     plSynced = true;
   } catch (_) { /* 오프라인/권한 거부면 로컬만 사용 */ }
   if (activeTab === "playlists") renderPlaylists();
+  prefetchPlaylistCovers();   // 각 플레이리스트 첫 곡 커버를 미리 받아 목록 탭이 즉시 채워지게
+}
+
+// 플레이리스트 목록 커버(첫 곡 앨범커버)를 시작 시 미리 캐시. 커스텀 커버가 있는
+// 목록은 로컬에 이미 있으니 건너뛴다. 대역폭 보호를 위해 하나씩 순차로 받는다.
+let plCoverPrefetchGen = 0;
+async function prefetchPlaylistCovers() {
+  const gen = ++plCoverPrefetchGen;
+  for (const p of playlists) {
+    if (gen !== plCoverPrefetchGen) return;   // 목록이 다시 동기화되면 중단
+    if (!p.rel || !p.rel.length || plGetCustomCover(p.id)) continue;
+    const first = trackByRel(p.rel[0]);
+    if (first) await prefetchCover(first);
+  }
 }
 
 // 새로고침 버튼: 공용 파일(_playlists.json)만 다시 읽어 PC 변경을 즉시 반영.
