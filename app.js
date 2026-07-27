@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v14";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v15";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -157,17 +157,18 @@ async function fetchTagBytes(fileId, lastByte = 1048575) {
   if (!r.ok && r.status !== 206) return null;
   return r.arrayBuffer();
 }
-// 커버 포함 태그를 '딱 필요한 만큼만' 받는다. 헤더 16KB를 먼저 읽어 ID3 태그 전체
-// 크기를 알아낸 뒤 그만큼만 받아, 1MB 고정 다운로드를 없앤다(커버 없는 곡은 16KB로 끝).
+// 커버 포함 태그를 받는다. 첫 요청에 256KB를 받아 '대부분의 앨범아트를 한 번의 왕복'에
+// 가져온다(모바일에선 왕복 지연이 커서, 16KB→재요청 2왕복보다 256KB 1왕복이 더 빠르다).
+// 커버가 256KB보다 크면(고해상도) 그때만 태그 크기만큼 두 번째로 받는다.
 async function fetchTagExact(fileId) {
-  const head = await fetchTagBytes(fileId, 16383);   // 16KB
+  const head = await fetchTagBytes(fileId, 262143);   // 256KB (한 왕복)
   if (!head) return null;
   const v = new Uint8Array(head);
   if (v.length < 10 || v[0] !== 0x49 || v[1] !== 0x44 || v[2] !== 0x33) return head; // ID3 아님
   const size = ((v[6] & 0x7f) << 21) | ((v[7] & 0x7f) << 14) | ((v[8] & 0x7f) << 7) | (v[9] & 0x7f);
   const end = 10 + size;                              // 태그 전체 끝(APIC 포함)
-  if (end <= v.length) return head;                  // 이미 16KB 안에 다 들어옴
-  return fetchTagBytes(fileId, Math.min(end, 4 * 1024 * 1024) - 1);   // 안전 상한 4MB
+  if (end <= v.length) return head;                  // 대개 256KB 안에 다 들어옴 → 1왕복 끝
+  return fetchTagBytes(fileId, Math.min(end, 4 * 1024 * 1024) - 1);   // 초대형 커버만 재요청
 }
 
 /* ── 커버 영구 캐시 (Cache API, 파일ID:크기 키) ──
@@ -194,6 +195,18 @@ async function putCachedCover(t, bytes, mime) {
     keys.push(key);
     while (keys.length > COVER_MAX) { const old = keys.shift(); c.delete(old).catch(() => {}); }
     LS.set(COVER_KEYS, keys);
+  } catch (_) {}
+}
+// 다음 곡 커버를 백그라운드로 미리 받아 캐시(순차 재생 시 스킵이 즉시 뜨게).
+async function prefetchCover(t) {
+  if (!t || !t.id) return;
+  try {
+    const c = await caches.open(COVER_CACHE);
+    if (await c.match(coverKey(t))) return;   // 이미 캐시됨
+    const buf = await fetchTagExact(t.id);
+    if (!buf) return;
+    const m = parseID3(buf);
+    if (m && m.cover) putCachedCover(t, m.cover.data, m.cover.mime);
   } catch (_) {}
 }
 
@@ -643,6 +656,8 @@ async function playByLibIndex(i, opts = {}) {
       setLyrics(m.uslt);
       updateMediaSession(title, artist, m.album, curCoverUrl);
       refresh();
+      // 순차 재생이면 다음 곡 커버를 미리 받아둔다(스킵 시 즉시 표시). 셔플은 예측 불가라 생략.
+      if (!shuffle && i === curIndex) prefetchCover(library[i + 1]);
     }
   } catch (e) {
     toast("재생 실패: " + e.message);
@@ -664,8 +679,18 @@ function setNowPlaying({ title, artist, album, year, genre, cover }) {
 function setCoverImg(sel, url) {
   const img = $(sel);
   if (!img) return;
-  if (url) { img.src = url; img.classList.add("has-art"); }
-  else { img.removeAttribute("src"); img.classList.remove("has-art"); }
+  img.onload = img.onerror = null;
+  if (url) {
+    // 로드 '성공'했을 때만 보이게 한다(has-art). 그 전엔 투명(=♪ 플레이스홀더가 보임)이라
+    // 로딩 중이거나 실패해도 '깨진 이미지' 아이콘이 절대 안 뜬다.
+    img.classList.remove("has-art");
+    img.onload = () => img.classList.add("has-art");
+    img.onerror = () => { img.removeAttribute("src"); img.classList.remove("has-art"); };
+    img.src = url;
+  } else {
+    img.removeAttribute("src");
+    img.classList.remove("has-art");
+  }
 }
 function setLyrics(uslt) {
   const box = $("#lyrics");
