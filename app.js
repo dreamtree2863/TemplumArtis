@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v21";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v22";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -202,13 +202,41 @@ async function putCachedCover(t, bytes, mime) {
     LS.set(COVER_KEYS, keys);
   } catch (_) {}
 }
-// 한 곡 커버를 백그라운드로 미리 받아 캐시.
+// Drive가 서버에서 리사이즈해주는 썸네일(thumbnailLink)로 커버를 받는다. 곡 파일에
+// 박힌 원본 커버는 500~1000px·평균 198KB(최대 2.8MB)라 표시 크기(썸네일 160px,
+// 전체화면 ~1000px)에 비해 과하다. =s{px} 로 필요한 크기만 받아 10~20배 적게 다운로드.
+// thumbnailLink는 짧게 만료되므로 쓸 때마다 새로 받아온다. 실패하면 null → 임베디드 폴백.
+const COVER_THUMB_PX = 512;   // 플레이리스트 썸네일·다음곡 미리보기용(전체화면은 재생 시 원본으로 교체)
+function sizedThumb(link, px) {
+  return /=s\d+/.test(link) ? link.replace(/=s\d+(-[a-z]+)?/, "=s" + px) : link + "=s" + px;
+}
+async function driveThumbBytes(t, px) {
+  if (t.hasThumb === false) return null;
+  try {
+    const token = await ensureToken();
+    const meta = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${t.id}?fields=hasThumbnail,thumbnailLink`,
+      { headers: { Authorization: "Bearer " + token } }).then((r) => (r.ok ? r.json() : null));
+    if (!meta) return null;
+    t.hasThumb = !!meta.hasThumbnail;
+    if (!meta.hasThumbnail || !meta.thumbnailLink) return null;
+    const r = await fetch(sizedThumb(meta.thumbnailLink, px),
+      { headers: { Authorization: "Bearer " + token } });
+    if (!r.ok) return null;
+    return { data: new Uint8Array(await r.arrayBuffer()), mime: r.headers.get("content-type") || "image/jpeg" };
+  } catch (_) { return null; }
+}
+
+// 한 곡 커버를 백그라운드로 미리 받아 캐시. 먼저 Drive 서버 썸네일(작고 빠름),
+// 없거나 실패하면 곡 파일의 임베디드 커버로 폴백.
 async function prefetchCover(t) {
   if (!t || !t.id) return;
   try {
     const c = await caches.open(COVER_CACHE);
     if (await c.match(coverKey(t))) return;   // 이미 캐시됨
-    const buf = await fetchTagExact(t.id);
+    const thumb = await driveThumbBytes(t, COVER_THUMB_PX);
+    if (thumb) { putCachedCover(t, thumb.data, thumb.mime); return; }
+    const buf = await fetchTagExact(t.id);     // 폴백: 임베디드 커버
     if (!buf) return;
     const m = parseID3(buf);
     if (m && m.cover) putCachedCover(t, m.cover.data, m.cover.mime);
@@ -250,6 +278,7 @@ function toTrack(f, rel) {
   return { id: f.id, name: f.name, size: +f.size || 0, rel: rel || f.name,
     artist: dash > 0 ? stem.slice(0, dash) : "",
     title: dash > 0 ? stem.slice(dash + 3) : stem,
+    hasThumb: f.hasThumbnail !== false,   // Drive 서버 썸네일 유무(없으면 임베디드 폴백)
     guessed: true };   // 아직 태그 미확인(추정값)
 }
 // 저장된 음악 폴더 경로 목록(My Drive 기준). 기본은 데스크톱 라이브러리 폴더.
@@ -284,7 +313,7 @@ async function listFolderAudio(rootIds, onProgress) {
     do {
       const q = encodeURIComponent(`'${parent}' in parents and trashed=false`);
       const url = `https://www.googleapis.com/drive/v3/files?q=${q}` +
-        `&fields=nextPageToken,files(id,name,size,mimeType)&pageSize=1000&orderBy=name&spaces=drive` +
+        `&fields=nextPageToken,files(id,name,size,mimeType,hasThumbnail)&pageSize=1000&orderBy=name&spaces=drive` +
         (pageToken ? `&pageToken=${pageToken}` : "");
       const data = await driveFetch(url, false);
       for (const f of data.files || []) {
