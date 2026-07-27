@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v11";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v12";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -13,10 +13,11 @@ const LS = {
   get: (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
   set: (k, v) => localStorage.setItem(k, JSON.stringify(v)),
 };
-// 음악은 읽기 전용(drive.readonly). 플레이리스트를 Drive에 저장하려면 쓰기가 필요한데,
-// 사용자 파일 전체를 건드리지 않도록 '앱 전용 숨김 폴더(appDataFolder)'만 쓰는 최소 권한을
-// 함께 요청한다. 이 폴더는 Drive 화면에 보이지 않고 이 앱이 만든 파일만 접근한다.
-const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.appdata";
+// 음악은 읽기 전용(drive.readonly). 플레이리스트는 음악 폴더의 _playlists.json으로
+// PC와 공유하며, 그 파일을 쓰려면 쓰기 권한이 필요하다. 사용자 파일 전체가 아니라
+// '이 앱이 만든 파일'만 접근하는 최소 권한(drive.file)을 함께 요청한다 → 폰이 그 파일을
+// 만들고 이후 계속 읽고 쓴다. PC는 로컬 마운트로 같은 파일을 본다.
+const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file";
 const AUDIO_EXTS = [".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".wma"];
 // 기존 Templum Sapientiae Mobile PWA와 같은 Google Cloud 프로젝트의 OAuth 클라이언트 ID.
 // 같은 github.io 계정(=같은 출처)에 올리면 승인된 JS 원본이 이미 등록돼 새 설정이 불필요하다.
@@ -55,7 +56,8 @@ let shownCoverForId = null;   // 지금 커버가 표시된 곡 id(캐시/태그
 let shuffle = false, repeat = "off";  // off|all|one
 let lyrics = null;           // [{t, text}] | {plain}
 let curLyricLine = -1;
-let playlists = LS.get("playlists", []);
+let playlists = [];          // [{id, name, rel:[상대경로], ts}] — syncPlaylists에서 로드
+let plTombs = {};            // {id: ts} 삭제 기록(PC에도 전파)
 let activeTab = "library";
 let appEntered = false;
 let sortMode = LS.get("sort_mode", "title");   // title|artist|album|year|genre
@@ -207,12 +209,13 @@ function isAudioFile(f) {
   if ((f.mimeType || "").startsWith("audio/")) return true;
   return AUDIO_EXTS.some((e) => f.name.toLowerCase().endsWith(e));
 }
-function toTrack(f) {
+function toTrack(f, rel) {
   const stem = f.name.replace(/\.[^.]+$/, "");
   const dash = stem.indexOf(" - ");
   // 파일 태그를 읽기 전의 '임시 추정'일 뿐이다. 실제 표시는 태그(TIT2/TPE1)를 우선하며,
   // 태그가 없을 때만 이 값이 남는다. 파일명 규칙은 "아티스트 - 제목"(데스크톱 저장 형식).
-  return { id: f.id, name: f.name, size: +f.size || 0,
+  // rel = 음악 폴더 기준 상대경로(예: "26.07.16/나무.mp3") — PC와 공유하는 곡 식별 열쇠.
+  return { id: f.id, name: f.name, size: +f.size || 0, rel: rel || f.name,
     artist: dash > 0 ? stem.slice(0, dash) : "",
     title: dash > 0 ? stem.slice(dash + 3) : stem,
     guessed: true };   // 아직 태그 미확인(추정값)
@@ -239,10 +242,12 @@ async function resolveFolderPath(path) {
   return parent;
 }
 // 지정 폴더들의 오디오 파일만 하위 폴더까지 재귀로 수집(드라이브 전체 아님).
+// 각 곡에 음악 폴더 기준 상대경로(rel)를 붙인다 — PC와 공유하는 곡 식별 열쇠.
 async function listFolderAudio(rootIds, onProgress) {
-  const out = [], seen = new Set(), queue = [...rootIds];
+  const out = [], seen = new Set();
+  const queue = rootIds.map((id) => ({ id, prefix: "" }));   // 루트는 prefix 없음
   while (queue.length) {
-    const parent = queue.shift();
+    const { id: parent, prefix } = queue.shift();
     let pageToken = "";
     do {
       const q = encodeURIComponent(`'${parent}' in parents and trashed=false`);
@@ -251,8 +256,14 @@ async function listFolderAudio(rootIds, onProgress) {
         (pageToken ? `&pageToken=${pageToken}` : "");
       const data = await driveFetch(url, false);
       for (const f of data.files || []) {
-        if (f.mimeType === "application/vnd.google-apps.folder") { queue.push(f.id); continue; }
-        if (isAudioFile(f) && !seen.has(f.id)) { seen.add(f.id); out.push(toTrack(f)); }
+        if (f.mimeType === "application/vnd.google-apps.folder") {
+          queue.push({ id: f.id, prefix: prefix + f.name + "/" });
+          continue;
+        }
+        if (isAudioFile(f) && !seen.has(f.id)) {
+          seen.add(f.id);
+          out.push(toTrack(f, prefix + f.name));
+        }
       }
       pageToken = data.nextPageToken || "";
       onProgress && onProgress(out.length);
@@ -677,44 +688,87 @@ function updatePositionState() {
   catch (_) {}
 }
 
-/* ───────────────────── 플레이리스트 (로컬 + Drive 동기화) ─────────────────────
-   플레이리스트는 폰 localStorage에 저장되는데, 앱을 지우면 사라진다. 그래서 Drive의
-   숨김 앱 폴더(appDataFolder)에 playlists.json으로도 저장한다. 재설치 후 로그인만
-   하면 그 파일에서 자동 복원된다. */
-const PL_FILE = "playlists.json";
-let plFileId = null;              // 원격 파일 id 캐시
+/* ───────────────────── 플레이리스트 (PC와 양방향 동기화) ─────────────────────
+   곡을 '음악 폴더 기준 상대경로(rel)'로 저장해 PC와 공유한다(폰=Drive 파일ID, PC=로컬
+   경로라 공통 열쇠가 필요). 공용 파일은 음악 폴더의 _playlists.json 하나. 폰은 그 파일을
+   drive.file 권한으로 만들고 읽고 쓰며, PC는 로컬 마운트로 같은 파일을 본다.
+   형식: { v:1, items:[ {id,name,rel:[...],ts} | {id,deleted:true,ts} ] } (playlist_sync와 동일). */
+const PL_FILE = "_playlists.json";
+let plFileId = null;          // 공용 파일 id 캐시
+let plParentId = null;        // 공용 파일을 둘 음악 루트 폴더 id (loadLibrary에서 설정)
 let plSaveTimer = null;
+let relToId = new Map();      // 상대경로 → Drive 파일 id (재생용)
+let idToRel = new Map();      // Drive 파일 id → 상대경로 (구 플레이리스트 이관용)
+const TOMB_TTL = 30 * 24 * 3600 * 1000;
 
-function plMediaUrl(id) { return `https://www.googleapis.com/drive/v3/files/${id}?alt=media`; }
+function buildRelMap() {
+  relToId = new Map(); idToRel = new Map();
+  for (const t of library) { relToId.set(t.rel, t.id); idToRel.set(t.id, t.rel); }
+}
 
-// appDataFolder에서 playlists.json 파일 id를 찾는다(없으면 null).
+// items ↔ 상태(playlists + plTombs) 변환
+function plItems() {
+  const items = playlists.map((p) => ({ id: p.id, name: p.name, rel: p.rel.slice(), ts: p.ts || 0 }));
+  for (const [id, ts] of Object.entries(plTombs)) items.push({ id, deleted: true, ts });
+  return items;
+}
+function plFromItems(items) {
+  const pls = [], tombs = {};
+  for (const it of items || []) {
+    if (!it || !it.id) continue;
+    if (it.deleted) tombs[it.id] = it.ts || 0;
+    else pls.push({ id: it.id, name: it.name || "", rel: Array.isArray(it.rel) ? it.rel : [], ts: it.ts || 0 });
+  }
+  playlists = pls; plTombs = tombs;
+}
+// playlist_sync.merge 의 JS 판(동일 규칙): id별 최신 ts 우선 + 오래된 tombstone 제거.
+function mergeItems(local, remote, now) {
+  const by = {};
+  for (const it of [...(local || []), ...(remote || [])]) {
+    if (!it || !it.id) continue;
+    if (!(it.id in by) || (it.ts || 0) > (by[it.id].ts || 0)) by[it.id] = it;
+  }
+  return Object.values(by).filter((it) => !(it.deleted && now - (it.ts || 0) > TOMB_TTL));
+}
+
+// 공용 파일 id 찾기(음악 루트 폴더 안에서). 없으면 null.
 async function findPlaylistFile() {
   if (plFileId) return plFileId;
+  if (!plParentId) return null;
   const token = await ensureToken();
-  const q = encodeURIComponent(`name='${PL_FILE}'`);
-  const url = `https://www.googleapis.com/drive/v3/files?q=${q}&spaces=appDataFolder&fields=files(id)&pageSize=1`;
+  const q = encodeURIComponent(`name='${PL_FILE}' and '${plParentId}' in parents and trashed=false`);
+  const url = `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id)&pageSize=1&spaces=drive`;
   const r = await fetch(url, { headers: { Authorization: "Bearer " + token } });
   if (!r.ok) throw new Error("Drive " + r.status);
   const data = await r.json();
   plFileId = (data.files && data.files[0]) ? data.files[0].id : null;
   return plFileId;
 }
-
-// 현재 플레이리스트를 Drive에 저장(있으면 갱신, 없으면 생성). 권한이 없으면 한 번 동의받고 재시도.
-async function pushPlaylistsToDrive() {
-  const body = JSON.stringify(playlists);
+async function readSharedItems() {
+  try {
+    const id = await findPlaylistFile();
+    if (!id) return [];
+    const token = await ensureToken();
+    const r = await fetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`,
+      { headers: { Authorization: "Bearer " + token }, cache: "no-store" });
+    if (!r.ok) return [];
+    const doc = await r.json();
+    return (doc && Array.isArray(doc.items)) ? doc.items : [];
+  } catch (_) { return []; }
+}
+// 공용 파일 저장(있으면 PATCH, 없으면 음악 폴더에 생성). 권한 없으면 한 번 동의받고 재시도.
+async function writeSharedItems(items) {
+  const body = JSON.stringify({ v: 1, items });
   async function write() {
     const token = await ensureToken();
     const id = await findPlaylistFile();
     if (id) {
       const r = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${id}?uploadType=media`, {
-        method: "PATCH",
-        headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
-        body,
-      });
+        method: "PATCH", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" }, body });
       if (!r.ok) throw new Error("Drive " + r.status);
     } else {
-      const meta = { name: PL_FILE, parents: ["appDataFolder"] };
+      if (!plParentId) throw new Error("no-parent");
+      const meta = { name: PL_FILE, parents: [plParentId] };
       const boundary = "ta" + Date.now().toString(36);
       const multipart =
         `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n` +
@@ -722,50 +776,69 @@ async function pushPlaylistsToDrive() {
       const r = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id", {
         method: "POST",
         headers: { Authorization: "Bearer " + token, "Content-Type": `multipart/related; boundary=${boundary}` },
-        body: multipart,
-      });
+        body: multipart });
       if (!r.ok) throw new Error("Drive " + r.status);
       const j = await r.json().catch(() => null);
       if (j && j.id) plFileId = j.id;
     }
   }
-  try {
-    await write();
-  } catch (e) {
-    // 아직 쓰기 권한(appdata)에 동의하지 않았으면 여기서 한 번 동의받는다(사용자 행동에 이어서).
-    if (/40[13]/.test(e.message)) {
-      await requestToken(true);
-      await write();
-      toast("플레이리스트를 Drive에 저장합니다(재설치해도 유지됨)");
-    }
+  try { await write(); }
+  catch (e) {
+    if (/40[13]/.test(e.message)) {   // 아직 쓰기 권한 동의 전 → 한 번 받고 재시도
+      await requestToken(true); await write();
+    } else throw e;
   }
 }
 
-// 앱 진입 시 Drive에서 복원. 로컬에 이미 있으면 로컬을 우선하고 Drive에 반영(덮어쓰기 방지),
-// 로컬이 비어 있으면(재설치 직후) Drive에서 가져온다.
-async function loadPlaylistsFromDrive() {
-  try {
-    if (playlists.length) { await pushPlaylistsToDrive(); return; }
-    const id = await findPlaylistFile();
-    if (!id) return;
-    const token = await ensureToken();
-    const r = await fetch(plMediaUrl(id), { headers: { Authorization: "Bearer " + token }, cache: "no-store" });
-    if (!r.ok) return;
-    const remote = await r.json();
-    if (Array.isArray(remote) && remote.length) {
-      playlists = remote;
-      LS.set("playlists", playlists);
-      if (activeTab === "playlists") renderPlaylists();
-      toast(`플레이리스트 ${remote.length}개를 복원했습니다`);
+// 라이브러리 로드 후 호출: 로컬+공용 병합 → 반영 → 공용 저장. 구(파일ID) 플레이리스트도 이관.
+let plSynced = false;
+async function syncPlaylists() {
+  buildRelMap();
+  // 공용 파일을 둘 음악 루트 폴더 id 확보(캐시 로드 땐 폴더 해석을 안 하므로 여기서 보강).
+  if (!plParentId) {
+    plParentId = LS.get("pl_parent", null);
+    if (!plParentId) {
+      try { plParentId = await resolveFolderPath(getFolderPaths()[0]); LS.set("pl_parent", plParentId); }
+      catch (_) {}
     }
-  } catch (_) { /* 권한 없음/오프라인이면 조용히 로컬만 사용 */ }
+  }
+  // 로컬 상태 로드(신형식 items)
+  plFromItems(LS.get("pl_items", []));
+  // 구형식(파일ID 기반 배열) 1회 이관 → rel
+  const legacy = LS.get("playlists", null);
+  if (Array.isArray(legacy) && legacy.length) {
+    const now = Date.now();
+    for (const old of legacy) {
+      const rel = (old.ids || []).map((fid) => idToRel.get(fid)).filter(Boolean);
+      if (!playlists.some((p) => p.id === old.id))
+        playlists.push({ id: old.id, name: old.name || "새 목록", rel, ts: now });
+    }
+    LS.set("playlists", []);   // 이관 완료 표시
+    LS.set("pl_items", plItems());
+  }
+  // 공용 파일과 병합
+  try {
+    const merged = mergeItems(plItems(), await readSharedItems(), Date.now());
+    plFromItems(merged);
+    LS.set("pl_items", plItems());
+    await writeSharedItems(plItems());   // 폰이 파일을 만들거나 갱신(양쪽 수렴)
+    plSynced = true;
+  } catch (_) { /* 오프라인/권한 거부면 로컬만 사용 */ }
+  if (activeTab === "playlists") renderPlaylists();
 }
 
 function savePlaylists() {
-  LS.set("playlists", playlists);
-  // Drive 저장은 약간 미뤄 묶어서(연속 편집 시 요청 폭주 방지).
+  LS.set("pl_items", plItems());
+  // 공용 저장은 약간 미뤄 묶는다. 저장 전 공용과 병합해 다른 기기 변경을 지키지 않도록.
   clearTimeout(plSaveTimer);
-  plSaveTimer = setTimeout(() => pushPlaylistsToDrive().catch(() => {}), 800);
+  plSaveTimer = setTimeout(async () => {
+    try {
+      const merged = mergeItems(plItems(), await readSharedItems(), Date.now());
+      plFromItems(merged); LS.set("pl_items", plItems());
+      await writeSharedItems(plItems());
+      if (activeTab === "playlists") renderPlaylists();
+    } catch (_) {}
+  }, 800);
 }
 function renderPlaylists() {
   const box = $("#pl-list");
@@ -775,7 +848,7 @@ function renderPlaylists() {
       <div class="track-thumb">≡</div>
       <div class="pl-item-body">
         <div class="pl-item-name">${escapeHtml(p.name)}</div>
-        <div class="pl-item-sub">${p.ids.length}곡</div>
+        <div class="pl-item-sub">${p.rel.length}곡</div>
       </div>
       <button class="track-add" data-plplay="${p.id}">▶</button>
     </div>`).join("");
@@ -787,13 +860,15 @@ function addCurrentToPlaylist() {
   const ans = prompt(`담을 플레이리스트 번호 (또는 새 이름 입력):\n${names || "(없음)"}`, "");
   if (ans == null) return;
   let pl = playlists[+ans - 1];
-  if (!pl) { pl = { id: Date.now().toString(36), name: ans.trim() || "새 목록", ids: [] }; playlists.push(pl); }
-  if (!pl.ids.includes(track.id)) pl.ids.push(track.id);
+  if (!pl) { pl = { id: Date.now().toString(36), name: ans.trim() || "새 목록", rel: [], ts: Date.now() }; playlists.push(pl); }
+  if (!pl.rel.includes(track.rel)) pl.rel.push(track.rel);
+  pl.ts = Date.now();
   savePlaylists(); renderPlaylists(); toast(`'${pl.name}'에 담았어요.`);
 }
 function playPlaylist(id) {
-  const pl = playlists.find((p) => p.id === id); if (!pl || !pl.ids.length) return toast("빈 목록입니다.");
-  const first = library.findIndex((t) => t.id === pl.ids[0]);
+  const pl = playlists.find((p) => p.id === id); if (!pl || !pl.rel.length) return toast("빈 목록입니다.");
+  const firstId = relToId.get(pl.rel[0]);
+  const first = firstId ? library.findIndex((t) => t.id === firstId) : -1;
   if (first >= 0) playByLibIndex(first); else toast("곡을 찾을 수 없습니다(라이브러리 새로고침 필요).");
 }
 
@@ -941,6 +1016,7 @@ async function loadLibrary(forceRefresh) {
   if (cached && !forceRefresh) {
     library = cached; applySearch();
     status.textContent = `${library.length}곡 (캐시) · ⟳ 로 새로고침`;
+    syncPlaylists();   // 라이브러리 준비됨 → 플레이리스트 동기화(rel 매핑 필요)
     return;
   }
   const paths = getFolderPaths();
@@ -962,6 +1038,9 @@ async function loadLibrary(forceRefresh) {
     saveLibCache();
     applySearch();
     status.textContent = `${library.length}곡` + (missing.length ? ` · ⚠️ 못 찾은 폴더: ${missing.join(", ")}` : "");
+    plParentId = rootIds[0];           // 공용 플레이리스트 파일을 둘 음악 루트 폴더
+    LS.set("pl_parent", plParentId);   // 캐시 로드 시 재사용
+    syncPlaylists();                   // 플레이리스트 PC와 동기화
   } catch (e) {
     status.textContent = "";
     $("#track-list").innerHTML = `<li class="entries-empty">목록 로딩 실패: ${escapeHtml(e.message)}</li>`;
@@ -995,8 +1074,7 @@ function enterApp() {
   $("#screen-auth").hidden = true;
   $("#screen-main").hidden = false;
   if (!appEntered) { appEntered = true; pushGuard(); }  // '이전' 버튼 트랩 시작
-  loadLibrary(false);
-  loadPlaylistsFromDrive();   // Drive에 저장된 플레이리스트가 있으면 복원
+  loadLibrary(false);   // 로드가 끝나면 내부에서 syncPlaylists()가 플레이리스트를 PC와 동기화
 }
 function signOut() {
   accessToken = ""; tokenExp = 0; LS.set("signed_in", false); LS.set("token", null);
