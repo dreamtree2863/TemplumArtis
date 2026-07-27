@@ -152,6 +152,7 @@
       <button id="btn-next" class="ctl">⏭</button>
       <button id="btn-repeat" class="ctl">🔁</button>
     </div>
+    <button id="upnext-chip" class="upnext-chip" hidden>≡ 다음 곡 <span id="upnext-count">0</span></button>
     <div class="fxrow" id="fxrow" title="앱이 직접 거는 공간감/울림 효과입니다. 갤럭시 Dolby Atmos(설정)와는 별개예요.">
       <span class="fx-cap">공간감</span>
       <button class="fx-btn active" data-fx="off">끄기</button>
@@ -174,14 +175,28 @@
 </section>
 <input type="file" id="pl-cover-file" accept="image/*" hidden>
 
-<!-- ─────────── 플레이리스트 담기 선택(바텀시트) ─────────── -->
+<!-- ─────────── 곡 담기/큐 선택(바텀시트) ─────────── -->
 <div id="pl-choose" class="sheet" hidden>
   <div class="sheet-backdrop"></div>
   <div class="sheet-panel">
-    <div class="sheet-title">플레이리스트에 담기</div>
+    <div class="sheet-title">이 곡을…</div>
+    <button id="choose-playnext" class="sheet-act">▶ 다음에 재생</button>
+    <button id="choose-queue" class="sheet-act">＋ 큐에 추가</button>
+    <div class="sheet-sep">플레이리스트에 담기</div>
     <div id="pl-choose-list" class="sheet-list"></div>
     <button id="pl-choose-new" class="sheet-new">＋ 새 플레이리스트</button>
     <button id="pl-choose-close" class="sheet-close">닫기</button>
+  </div>
+</div>
+
+<!-- ─────────── 재생큐(up-next) 목록(바텀시트) ─────────── -->
+<div id="upnext-sheet" class="sheet" hidden>
+  <div class="sheet-backdrop"></div>
+  <div class="sheet-panel">
+    <div class="sheet-title">재생큐 (다음 곡)</div>
+    <div id="upnext-list" class="sheet-list"></div>
+    <button id="upnext-clear" class="sheet-new">비우기</button>
+    <button id="upnext-close" class="sheet-close">닫기</button>
   </div>
 </div>
 

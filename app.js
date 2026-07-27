@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v28";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v29";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -61,6 +61,7 @@ let plTombs = {};            // {id: ts} 삭제 기록(PC에도 전파)
 let selectedPlaylistId = null;   // 상세 뷰로 열어본 플레이리스트(null이면 목록)
 let plQueue = null;          // 재생 큐(플레이리스트 재생 시 라이브러리 인덱스 배열)
 let plQueuePos = -1;         // 큐 내 현재 위치
+let upNext = [];             // 사용자 지정 재생큐(다음에 재생/큐에 추가) — 곡 id 배열, 세션 한정
 let pendingCoverPl = null;   // 커버 사진 선택 중인 플레이리스트 id
 let pickerPlId = null;       // '곡 추가' 피커가 대상으로 하는 플레이리스트 id
 let activeTab = "library";
@@ -928,6 +929,14 @@ function syncLyrics() {
 }
 function nextTrack(auto) {
   if (repeat === "one" && auto) { audio.currentTime = 0; audio.play(); return; }
+  // 사용자 지정 재생큐(다음에 재생/큐에 추가)를 가장 먼저 소비한다. 플레이리스트 재생
+  // 중이면 그 곡을 '끼워' 재생하고, 큐가 비면 원래 플레이리스트가 이어진다(plQueue 유지).
+  while (upNext.length) {
+    const id = upNext.shift();
+    const idx = library.findIndex((t) => t.id === id);
+    if (idx >= 0) { reflectUpNext(); playByLibIndex(idx); return; }
+  }
+  reflectUpNext();
   // 플레이리스트 재생 중이면 그 큐 안에서 다음 곡으로.
   if (plQueue && plQueue.length) {
     let p;
@@ -1389,6 +1398,56 @@ function chooseNewPlaylist() {
   chooseAddToPlaylist(pl.id);
 }
 
+/* ── 사용자 재생큐(다음에 재생 / 큐에 추가) — 세션 한정, 동기화 안 함 ── */
+function queueAddTrack(track, front) {
+  if (!track || !track.id) return;
+  const i = upNext.indexOf(track.id);
+  if (i >= 0) upNext.splice(i, 1);            // 중복 제거
+  if (front) upNext.unshift(track.id); else upNext.push(track.id);
+  reflectUpNext();
+  toast(front ? "다음에 재생합니다." : "큐에 추가했어요.");
+}
+function removeUpNextAt(pos) {
+  if (pos < 0 || pos >= upNext.length) return;
+  upNext.splice(pos, 1);
+  reflectUpNext(); renderUpNext();
+}
+function clearUpNext() { upNext = []; reflectUpNext(); renderUpNext(); }
+// 플레이어의 '다음 곡 N' 칩 표시 갱신.
+function reflectUpNext() {
+  const chip = $("#upnext-chip");
+  if (!chip) return;
+  chip.hidden = upNext.length === 0;
+  const c = $("#upnext-count");
+  if (c) c.textContent = upNext.length;
+}
+// 재생큐 목록 바텀시트
+function renderUpNext() {
+  const box = $("#upnext-list");
+  if (!box) return;
+  if (!upNext.length) { box.innerHTML = `<div class="sheet-empty">재생큐가 비어 있습니다.<br>곡의 ＋에서 '다음에 재생 / 큐에 추가'.</div>`; return; }
+  box.innerHTML = upNext.map((id, pos) => {
+    const t = library.find((x) => x.id === id);
+    const title = t ? t.title : id;
+    const artist = t ? (t.artist || "알 수 없는 아티스트") : "";
+    return `<div class="sheet-row" data-uppos="${pos}">
+        <div class="sheet-row-name" style="flex:1;min-width:0">${escapeHtml(title)}<br>
+          <span class="sheet-row-cnt" style="font-weight:400">${escapeHtml(artist)}</span></div>
+        <button class="upnext-rm" data-uprm="${pos}" title="제거">×</button>
+      </div>`;
+  }).join("");
+}
+function openUpNext() {
+  renderUpNext();
+  const s = $("#upnext-sheet"); s.hidden = false;
+  requestAnimationFrame(() => s.classList.add("open"));
+  try { history.pushState({ taUpNext: 1 }, ""); } catch (_) {}
+}
+function closeUpNext() {
+  const s = $("#upnext-sheet"); s.classList.remove("open");
+  setTimeout(() => { s.hidden = true; }, 200);
+}
+
 /* ── 재생 큐(플레이리스트를 순서대로) ── */
 function playlistIndices(pl) {
   const out = [];
@@ -1833,15 +1892,28 @@ function bind() {
   // '곡 추가' 피커
   $("#plp-close").addEventListener("click", () => { if (history.state && history.state.taPicker) history.back(); else closeAddPicker(); });
 
-  // 플레이리스트 담기 바텀시트
+  // 곡 담기/큐 바텀시트
   $("#pl-choose-list").addEventListener("click", (e) => {
     const b = e.target.closest("[data-plchoose]");
     if (b) chooseAddToPlaylist(b.dataset.plchoose);
   });
   $("#pl-choose-new").addEventListener("click", chooseNewPlaylist);
   const closeChoose = () => { if (history.state && history.state.taChoose) history.back(); else closePlaylistChooser(); };
+  $("#choose-playnext").addEventListener("click", () => { queueAddTrack(chooseTrack, true); closeChoose(); });
+  $("#choose-queue").addEventListener("click", () => { queueAddTrack(chooseTrack, false); closeChoose(); });
   $("#pl-choose-close").addEventListener("click", closeChoose);
   $("#pl-choose .sheet-backdrop").addEventListener("click", closeChoose);
+
+  // 재생큐(up-next) 시트
+  const closeUp = () => { if (history.state && history.state.taUpNext) history.back(); else closeUpNext(); };
+  $("#upnext-chip").addEventListener("click", openUpNext);
+  $("#upnext-close").addEventListener("click", closeUp);
+  $("#upnext-sheet .sheet-backdrop").addEventListener("click", closeUp);
+  $("#upnext-clear").addEventListener("click", () => { clearUpNext(); });
+  $("#upnext-list").addEventListener("click", (e) => {
+    const rm = e.target.closest("[data-uprm]");
+    if (rm) removeUpNextAt(parseInt(rm.dataset.uprm));
+  });
   let pickerSearchT = null;
   $("#plp-search").addEventListener("input", (e) => {
     clearTimeout(pickerSearchT);
@@ -1889,6 +1961,7 @@ function bind() {
   //  · 어느 경우든 히스토리 트랩을 다시 세워 '이전'으로 앱이 종료되지 않게 함
   //  → 완전히 끄려면 홈(백그라운드 재생 유지) 또는 '최근 앱'에서 밀기.
   window.addEventListener("popstate", () => {
+    if (!$("#upnext-sheet").hidden) { closeUpNext(); pushGuard(); return; }   // 재생큐 시트 먼저 닫기
     if (!$("#pl-choose").hidden) { closePlaylistChooser(); pushGuard(); return; }   // 담기 시트 먼저 닫기
     if (!$("#pl-picker").hidden) { closeAddPicker(); pushGuard(); return; }   // 피커 먼저 닫기
     if (!$("#player").hidden) { closePlayerUI(); pushGuard(); return; }
