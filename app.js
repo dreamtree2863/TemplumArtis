@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v15";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v16";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -176,7 +176,7 @@ async function fetchTagExact(fileId) {
    키에 파일 크기를 넣어, 파일이 바뀌면(재태깅) 자동으로 새로 받는다. LRU로 개수 제한. */
 const COVER_CACHE = "ta-covers";
 const COVER_KEYS = "cover_keys";
-const COVER_MAX = 200;
+const COVER_MAX = 500;   // 최근 재생·프리페치한 커버 보관 수(대략 40~60MB)
 function coverKey(t) { return `cover/${t.id}:${t.size || 0}`; }
 async function getCachedCover(t) {
   try {
@@ -197,7 +197,7 @@ async function putCachedCover(t, bytes, mime) {
     LS.set(COVER_KEYS, keys);
   } catch (_) {}
 }
-// 다음 곡 커버를 백그라운드로 미리 받아 캐시(순차 재생 시 스킵이 즉시 뜨게).
+// 한 곡 커버를 백그라운드로 미리 받아 캐시.
 async function prefetchCover(t) {
   if (!t || !t.id) return;
   try {
@@ -208,6 +208,16 @@ async function prefetchCover(t) {
     const m = parseID3(buf);
     if (m && m.cover) putCachedCover(t, m.cover.data, m.cover.mime);
   } catch (_) {}
+}
+// 현재 곡 다음 N곡의 커버를 순서대로 미리 받는다(스킵/자동재생 시 즉시 표시).
+// 한꺼번에 몰아 받지 않고 하나씩 이어 받아 재생 스트림 대역폭을 덜 뺏는다.
+let prefetchGen = 0;
+async function prefetchCoversAhead(fromIndex, n) {
+  const gen = ++prefetchGen;               // 곡이 바뀌면 이전 프리페치는 중단
+  for (let k = 1; k <= n; k++) {
+    if (gen !== prefetchGen) return;
+    await prefetchCover(library[fromIndex + k]);
+  }
 }
 
 /* ───────────────────── Drive API ───────────────────── */
@@ -528,15 +538,17 @@ function startPlayback(url, crossfade) {
    별개로, 앱이 <audio> 출력을 Web Audio 그래프에 태워 리버브(울림)+스테레오 확장을
    직접 거는 효과다. 두 오디오 요소(크로스페이드용) 모두 한 그래프에 물린다.
    기본 꺼짐. 켤 때만 그래프를 만든다(안 켜면 기존 재생 경로를 전혀 안 건드림). */
-let actx = null, spDry = null, spWet = null, spConv = null, spPre = null, spaceReady = false, spaceApplied = false;
+// 그래프: source → spComp(음량 평준화 컴프) → spMakeup → [spDry(통과) + spPre→spConv→spWet(리버브)] → 출력
+// 공간감(리버브)과 음량 평준화(컴프레션)를 한 체인에서 각각 켜고 끈다. 둘 다 꺼져 있으면
+// 그래프를 아예 만들지 않아 기존 재생 경로를 안 건드린다.
+let actx = null, spDry = null, spWet = null, spConv = null, spPre = null, spComp = null, spMakeup = null;
+let spaceReady = false, spaceApplied = false, normApplied = false;
 const spaceSources = new WeakMap();
 const SPACE_PRESETS = {
   off:  { dry: 1.0, wet: 0.0, pre: 0.0, ir: null },
   soft: { dry: 0.92, wet: 0.16, pre: 0.02, ir: [2.0, 2.4] },
   wide: { dry: 0.85, wet: 0.32, pre: 0.03, ir: [2.6, 1.8] },
 };
-// 감쇠하는 스테레오 노이즈로 임펄스 응답을 만든다(외부 파일 없이 — CSP 안전).
-// 좌/우를 독립 난수로 채워 스테레오 폭까지 넓어진다.
 function makeIR(seconds, decay) {
   const rate = actx.sampleRate, len = Math.max(1, (seconds * rate) | 0);
   const buf = actx.createBuffer(2, len, rate);
@@ -546,11 +558,18 @@ function makeIR(seconds, decay) {
   }
   return buf;
 }
+// 컴프레서를 '투명'(압축 안 함)으로 — 음량 평준화 끔 상태.
+function setCompTransparent() {
+  if (!spComp) return;
+  spComp.threshold.value = 0; spComp.knee.value = 0; spComp.ratio.value = 1;
+  spComp.attack.value = 0.003; spComp.release.value = 0.25;
+  if (spMakeup) spMakeup.gain.value = 1;
+}
 function routeSpace(el) {
   if (!actx || spaceSources.has(el)) return;
   try {
     const s = actx.createMediaElementSource(el);
-    s.connect(spDry); s.connect(spPre);
+    s.connect(spComp);            // 모든 소리는 컴프레서를 먼저 지난다(투명이면 무변화)
     spaceSources.set(el, s);
   } catch (_) { /* 이미 연결됐거나 실패 — 무시 */ }
 }
@@ -560,12 +579,16 @@ function ensureSpaceGraph() {
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return false;
     actx = new AC();
+    spComp = actx.createDynamicsCompressor(); setCompTransparent();
+    spMakeup = actx.createGain(); spMakeup.gain.value = 1;
     spDry = actx.createGain(); spWet = actx.createGain();
     spConv = actx.createConvolver(); spPre = actx.createDelay(0.2);
     spConv.buffer = makeIR(2.2, 2.0);
+    spComp.connect(spMakeup);
+    spMakeup.connect(spDry); spMakeup.connect(spPre);
     spPre.connect(spConv); spConv.connect(spWet);
     spDry.connect(actx.destination); spWet.connect(actx.destination);
-    routeSpace(audio); routeSpace(spare);   // 두 요소(크로스페이드) 모두 물린다
+    routeSpace(audio); routeSpace(spare);
     spaceReady = true;
     return true;
   } catch (_) { spaceReady = false; return false; }
@@ -589,13 +612,27 @@ function applySpace(mode, save) {
   spPre.delayTime.value = p.pre;
   spDry.gain.value = p.dry; spWet.gain.value = p.wet;
 }
+// 음량 평준화: 완만한 컴프레션 + 메이크업 게인으로 곡 간 볼륨 차를 줄인다(PC normvol과 결 맞춤).
+function reflectNormUI(on) { const b = $("#fx-norm"); if (b) b.classList.toggle("active", !!on); }
+function applyNormalize(on, save) {
+  on = !!on;
+  if (save !== false) LS.set("norm_fx", on ? "1" : "");
+  reflectNormUI(on);
+  if (!on) { if (spaceReady) setCompTransparent(); return; }
+  if (!ensureSpaceGraph()) { toast("이 기기에선 음량 평준화를 쓸 수 없어요."); LS.set("norm_fx", ""); reflectNormUI(false); return; }
+  if (actx.state === "suspended") actx.resume().catch(() => {});
+  spComp.threshold.value = -24; spComp.knee.value = 30; spComp.ratio.value = 3;
+  spComp.attack.value = 0.01; spComp.release.value = 0.3;
+  spMakeup.gain.value = 1.6;   // 눌린 큰음을 보상해 조용한 곡을 끌어올림
+}
 
 async function playByLibIndex(i, opts = {}) {
   if (i < 0 || i >= library.length) return;
   advancing = false;                 // 자동 크로스페이드 예약 해제(새 곡 시작)
   curIndex = i;
-  // 저장된 공간감 설정을 첫 재생(=사용자 제스처) 때 한 번 실제로 건다.
+  // 저장된 공간감·음량 평준화 설정을 첫 재생(=사용자 제스처) 때 한 번 실제로 건다.
   if (!spaceApplied) { spaceApplied = true; const m = LS.get("space_fx", "off"); if (m !== "off") applySpace(m, false); }
+  if (!normApplied) { normApplied = true; if (LS.get("norm_fx", "")) applyNormalize(true, false); }
   const track = library[i];
   $("#mini").hidden = false;
   // 정보는 태그에서 온 것만 보여준다. 아직 태그를 안 읽은 곡이면 추정값(파일명)을
@@ -656,8 +693,8 @@ async function playByLibIndex(i, opts = {}) {
       setLyrics(m.uslt);
       updateMediaSession(title, artist, m.album, curCoverUrl);
       refresh();
-      // 순차 재생이면 다음 곡 커버를 미리 받아둔다(스킵 시 즉시 표시). 셔플은 예측 불가라 생략.
-      if (!shuffle && i === curIndex) prefetchCover(library[i + 1]);
+      // 순차 재생이면 '다음 여러 곡' 커버를 미리 받아둔다(스킵 시 즉시 표시). 셔플은 예측 불가라 생략.
+      if (!shuffle && i === curIndex) prefetchCoversAhead(i, 4);
     }
   } catch (e) {
     toast("재생 실패: " + e.message);
@@ -1027,7 +1064,7 @@ function persistLibrary() {
 const enrichPending = new Set();   // 대기/진행 중인 곡 id
 let enrichActive = 0;
 const enrichQueue = [];
-const ENRICH_CONC = 3;
+const ENRICH_CONC = 6;   // 동시 태그 읽기 수(브라우저 호스트당 동시 연결 한도 안쪽)
 
 function queueEnrich(t) {
   if (!t || t.enriched || enrichPending.has(t.id)) return;
@@ -1046,7 +1083,7 @@ function pumpEnrich() {
 }
 async function enrichOne(t) {
   try {
-    const buf = await fetchTagBytes(t.id, 98303);   // 96KB — 텍스트 프레임엔 충분(커버 제외)
+    const buf = await fetchTagBytes(t.id, 32767);   // 32KB — 텍스트 프레임은 대개 태그 앞쪽(커버 앞)
     if (buf) {
       const m = parseID3(buf);
       if (m.title) t.title = m.title;
@@ -1058,6 +1095,12 @@ async function enrichOne(t) {
   t.enriched = true;
   persistLibrary();
   updateRowInPlace(t);
+}
+// 로드 후 백그라운드로 '전 곡'의 태그를 미리 읽어 캐시에 채운다. 그러면 다음부턴
+// 목록·재생 정보가 추정값 없이 처음부터 실제 태그로 뜬다(곡당 32KB, 한 번만·영구 캐시).
+// 큐(동시 6개)로 처리하므로 재생/커버 프리페치와 함께 돌아도 무리가 없다.
+function enrichAllBg() {
+  for (const t of library) if (!t.enriched) queueEnrich(t);
 }
 // 이미 화면에 있는 행이면 값만 제자리 갱신(다시 그리지 않아 스크롤·깜빡임 없음).
 function updateRowInPlace(t) {
@@ -1121,6 +1164,7 @@ async function loadLibrary(forceRefresh) {
     library = cached; applySearch();
     status.textContent = `${library.length}곡 (캐시) · ⟳ 로 새로고침`;
     syncPlaylists();   // 라이브러리 준비됨 → 플레이리스트 동기화(rel 매핑 필요)
+    enrichAllBg();     // 캐시에 아직 태그 없는 곡이 있으면 백그라운드로 마저 채운다
     return;
   }
   const paths = getFolderPaths();
@@ -1145,6 +1189,7 @@ async function loadLibrary(forceRefresh) {
     plParentId = rootIds[0];           // 공용 플레이리스트 파일을 둘 음악 루트 폴더
     LS.set("pl_parent", plParentId);   // 캐시 로드 시 재사용
     syncPlaylists();                   // 플레이리스트 PC와 동기화
+    enrichAllBg();                     // 전 곡 태그를 백그라운드로 미리 읽어 캐시(처음부터 실제 태그)
   } catch (e) {
     status.textContent = "";
     $("#track-list").innerHTML = `<li class="entries-empty">목록 로딩 실패: ${escapeHtml(e.message)}</li>`;
@@ -1178,7 +1223,20 @@ function enterApp() {
   $("#screen-auth").hidden = true;
   $("#screen-main").hidden = false;
   if (!appEntered) { appEntered = true; pushGuard(); }  // '이전' 버튼 트랩 시작
+  acquireWakeLock();    // 앱을 쓰는 동안 화면이 꺼지지 않게
   loadLibrary(false);   // 로드가 끝나면 내부에서 syncPlaylists()가 플레이리스트를 PC와 동기화
+}
+
+// 화면 꺼짐 방지(Wake Lock). 화면이 잠기거나 탭이 숨으면 락이 자동 해제되므로,
+// 다시 보일 때 재획득한다. 미지원 기기(구형 iOS 등)에서는 조용히 무시.
+let wakeLock = null;
+async function acquireWakeLock() {
+  try {
+    if ("wakeLock" in navigator && document.visibilityState === "visible") {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => { wakeLock = null; });
+    }
+  } catch (_) { wakeLock = null; }
 }
 function signOut() {
   accessToken = ""; tokenExp = 0; LS.set("signed_in", false); LS.set("token", null);
@@ -1263,9 +1321,9 @@ function bind() {
 
   // 미디어 알림을 탭하면 앱이 포그라운드로 온다 → 재생 중이면 전체 재생화면을 편다.
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && curIndex >= 0 && !audio.paused && $("#player").hidden) {
-      openPlayer();
-    }
+    if (document.visibilityState !== "visible") return;
+    if (appEntered) acquireWakeLock();   // 화면 꺼짐 방지 락은 숨김 시 해제되므로 재획득
+    if (curIndex >= 0 && !audio.paused && $("#player").hidden) openPlayer();
   });
 
   // 안드로이드 '이전' 버튼: 앱을 닫지 않는다(음악 유지 우선).
@@ -1304,9 +1362,11 @@ function bind() {
   const fxrow = $("#fxrow");
   if (fxrow) fxrow.addEventListener("click", (e) => {
     const b = e.target.closest(".fx-btn"); if (!b) return;
+    if (b.id === "fx-norm") { applyNormalize(!b.classList.contains("active"), true); return; }
     applySpace(b.dataset.fx, true);
   });
   reflectSpaceUI(LS.get("space_fx", "off"));   // 저장된 설정 표시(그래프는 첫 재생/토글 때 생성)
+  reflectNormUI(!!LS.get("norm_fx", ""));
 
   // 시크바
   const seek = $("#seek");
