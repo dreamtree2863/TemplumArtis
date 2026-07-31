@@ -107,10 +107,17 @@
     <div id="mini-prog" class="mini-prog"><span></span></div>
   </div>
 
+  <!-- 통계 탭 -->
+  <div class="tabview" data-view="stats" hidden>
+    <div class="pl-head"><h2>통계</h2></div>
+    <div id="stats-body" class="stats-body"></div>
+  </div>
+
   <!-- 하단 탭 -->
   <nav class="tabbar">
     <button class="tab active" data-tab="library"><span>♪</span>곡</button>
     <button class="tab" data-tab="playlists"><span>≡</span>목록</button>
+    <button class="tab" data-tab="stats"><span>▤</span>통계</button>
   </nav>
 </section>
 
@@ -161,6 +168,10 @@
       <span class="fx-cap">음량</span>
       <button class="fx-btn" id="fx-norm" title="곡마다 다른 볼륨을 비슷하게 맞춰 곡이 바뀔 때 확 커지거나 작아지는 걸 줄입니다.">평준화</button>
     </div>
+    <div class="fxrow fxrow2">
+      <button class="fx-btn" id="fx-eq" title="10밴드 이퀄라이저">🎚 EQ</button>
+      <button class="fx-btn" id="fx-sleep" title="슬립 타이머">🌙</button>
+    </div>
   </div>
 </section>
 
@@ -197,6 +208,34 @@
     <div id="upnext-list" class="sheet-list"></div>
     <button id="upnext-clear" class="sheet-new">비우기</button>
     <button id="upnext-close" class="sheet-close">닫기</button>
+  </div>
+</div>
+
+<!-- ─────────── 이퀄라이저(바텀시트) ─────────── -->
+<div id="eq-sheet" class="sheet" hidden>
+  <div class="sheet-backdrop"></div>
+  <div class="sheet-panel eq-panel">
+    <div class="sheet-title">이퀄라이저</div>
+    <div id="eq-body" class="eq-body"></div>
+    <button id="eq-close" class="sheet-close">닫기</button>
+  </div>
+</div>
+
+<!-- ─────────── 슬립 타이머(바텀시트) ─────────── -->
+<div id="sleep-sheet" class="sheet" hidden>
+  <div class="sheet-backdrop"></div>
+  <div class="sheet-panel">
+    <div class="sheet-title">슬립 타이머</div>
+    <div id="sleep-opts" class="sleep-opts">
+      <button class="sleep-opt" data-sleep="off">끄기</button>
+      <button class="sleep-opt" data-sleep="10">10분</button>
+      <button class="sleep-opt" data-sleep="20">20분</button>
+      <button class="sleep-opt" data-sleep="30">30분</button>
+      <button class="sleep-opt" data-sleep="45">45분</button>
+      <button class="sleep-opt" data-sleep="60">60분</button>
+      <button class="sleep-opt wide" data-sleep="track">이 곡이 끝나면</button>
+    </div>
+    <button id="sleep-close" class="sheet-close">닫기</button>
   </div>
 </div>
 

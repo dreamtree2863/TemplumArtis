@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v30";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v31";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -68,6 +68,9 @@ let activeTab = "library";
 let appEntered = false;
 let sortMode = LS.get("sort_mode", "title");   // title|artist|album|year|genre
 let viewMode = "list";       // list|album
+let selectedAlbum = null;     // 앨범 상세로 열어본 앨범 키(null이면 앨범 그리드)
+let resumeTrackId = null, pendingSeek = null, resumeSaveT = 0;   // 이어듣기(마지막 곡·위치)
+let sleepTimer = null, sleepTick = null, sleepEndAt = 0, sleepAfterTrack = false;   // 슬립 타이머
 
 // 크로스페이드용 오디오 2개. audio는 항상 '활성' 요소를 가리키고, spare는 대기.
 // 곡을 바꿀 때 spare에 새 곡을 올려 서로 볼륨을 교차시킨 뒤 역할을 바꾼다.
@@ -207,6 +210,7 @@ async function putCachedCover(t, bytes, mime) {
 // 곡 파일(200KB±)을 열어 커버를 추출하는 대신, 음악 폴더의 _covers/<rel해시>.jpg
 // 작은 파일(≈20~60KB) 하나만 받는다. PC와 같은 rel 해시(SHA-256 앞 16자리, NFC)를 쓴다.
 let coverFolderId = null;      // _covers 폴더 id
+let indexFileId = null;        // _covers/index.json id (곡해시 → 커버 파일)
 let coverMap = null;           // {rel해시: 파일ID}
 let coverMapLoading = null;
 async function relHash(rel) {
@@ -241,9 +245,27 @@ async function ensureCoverMap() {
         for (const f of data.files || []) {
           const key = (f.name || "").replace(/\.jpg$/i, "");
           if (key) map[key] = f.id;
+          if ((f.name || "").toLowerCase() === "index.json") indexFileId = f.id;
         }
         pageToken = data.nextPageToken || "";
       } while (pageToken);
+      // 커버 그림은 앨범 단위로 같아 PC가 앨범당 파일 하나만 남긴다.
+      // index.json이 '곡 해시 → 실제 커버 파일'을 알려주므로, 자기 이름의
+      // 파일이 없는 곡도 앨범 대표 파일을 그대로 받아 쓸 수 있다.
+      if (indexFileId) {
+        const idx = await fetch(
+          `https://www.googleapis.com/drive/v3/files/${indexFileId}?alt=media`,
+          { headers: { Authorization: "Bearer " + token } })
+          .then((r) => (r.ok ? r.json() : null)).catch(() => null);
+        const tracks = idx && idx.tracks;
+        if (tracks) {
+          for (const [stem, fname] of Object.entries(tracks)) {
+            if (map[stem]) continue;                       // 제 파일이 이미 있다
+            const id = map[String(fname).replace(/\.jpg$/i, "")];
+            if (id) map[stem] = id;
+          }
+        }
+      }
     } catch (_) {}
     coverMap = map;
     return map;
@@ -591,9 +613,12 @@ function renderAlbums() {
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(t);
   }
+  // 앨범을 골라 열어둔 상태면 그 앨범의 곡 목록(상세)을 보여준다.
+  if (selectedAlbum && groups.has(selectedAlbum)) { renderAlbumDetail(selectedAlbum, groups.get(selectedAlbum)); return; }
+  selectedAlbum = null;
   const cards = [...groups.entries()].map(([album, ts]) => {
     const ids = ts.map((t) => t.id).join(",");
-    return `<div class="album-card" data-ids="${ids}">
+    return `<div class="album-card" data-ids="${ids}" data-album="${escapeHtml(album)}">
       <div class="album-art">♪</div>
       <div class="album-cap">
         <div class="album-name">${escapeHtml(album)}</div>
@@ -602,6 +627,65 @@ function renderAlbums() {
     </div>`;
   }).join("");
   box.innerHTML = `<div class="album-grid">${cards}</div>`;
+}
+// 앨범 상세: 헤더(커버·정보·전체/셔플 재생) + 곡 목록. PC 앨범 상세와 결을 맞춤.
+function renderAlbumDetail(album, ts) {
+  const box = $("#track-list");
+  const tracks = ts.slice().sort((a, b) => (a.title || "").localeCompare(b.title || "", "ko"));
+  const artist = tracks[0].artist || "";
+  const years = [...new Set(tracks.map((t) => t.year).filter(Boolean))].sort();
+  const rows = tracks.map((t) => `
+    <div class="track" data-id="${t.id}">
+      <div class="track-thumb">♪</div>
+      <div class="track-body">
+        <div class="track-title">${escapeHtml(t.title)}</div>
+        <div class="track-artist">${escapeHtml(t.artist || "")}</div>
+      </div>
+      <button class="track-add" data-add="${t.id}">＋</button>
+    </div>`).join("");
+  box.innerHTML = `<div class="albumdetail">
+      <div class="ad-head">
+        <button class="pld-back" id="ad-back">‹</button>
+        <div class="ad-art" id="ad-art">♪</div>
+        <div class="ad-info">
+          <div class="ad-name">${escapeHtml(album)}</div>
+          <div class="ad-sub">${escapeHtml(artist)} · ${tracks.length}곡${years.length ? " · " + escapeHtml(years.join("/")) : ""}</div>
+          <div class="ad-actions">
+            <button class="ad-play" id="ad-playall">▶ 전체재생</button>
+            <button class="ad-play alt" id="ad-shuffle">🔀 셔플</button>
+          </div>
+        </div>
+      </div>
+      <div class="ad-tracks">${rows}</div>
+    </div>`;
+  const first = tracks[0];
+  getCachedCover(first).then((url) => {
+    if (url) return setAdArt(url);
+    storeCoverBytes(first).then((c) => { if (c) setAdArt(URL.createObjectURL(new Blob([c.data], { type: c.mime }))); });
+  });
+}
+function setAdArt(url) {
+  const el = $("#ad-art"); if (!el || !url) return;
+  el.innerHTML = `<img src="${url}" alt="">`; el.classList.add("has");
+}
+// 현재 앨범 상세의 곡들을 큐로 만들어 재생(전체/셔플, 또는 특정 곡부터).
+function albumQueueIdxs() {
+  return [...$("#track-list").querySelectorAll(".ad-tracks .track")]
+    .map((r) => library.findIndex((t) => t.id === r.dataset.id)).filter((i) => i >= 0);
+}
+function albumPlay(shuffleIt) {
+  const idxs = albumQueueIdxs();
+  if (!idxs.length) return toast("재생할 수 있는 곡이 없습니다.");
+  if (shuffleIt) for (let i = idxs.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [idxs[i], idxs[j]] = [idxs[j], idxs[i]]; }
+  plQueue = idxs; plQueuePos = 0; playByLibIndex(idxs[0]); openPlayer();
+}
+function albumPlayFrom(id) {
+  const ids = [...$("#track-list").querySelectorAll(".ad-tracks .track")].map((r) => r.dataset.id);
+  const idxs = ids.map((x) => library.findIndex((t) => t.id === x)).filter((i) => i >= 0);
+  const pos = ids.indexOf(id); if (pos < 0 || !idxs.length) return;
+  let qpos = 0; for (let i = 0; i < pos; i++) if (library.findIndex((t) => t.id === ids[i]) >= 0) qpos++;
+  plQueue = idxs; plQueuePos = Math.min(qpos, idxs.length - 1);
+  playByLibIndex(plQueue[plQueuePos]); openPlayer();
 }
 
 /* ───────────────────── 재생 ───────────────────── */
@@ -737,17 +821,26 @@ function ensureSpaceGraph() {
     spDry = actx.createGain(); spWet = actx.createGain();
     spConv = actx.createConvolver(); spPre = actx.createDelay(0.2);
     spConv.buffer = makeIR(2.2, 2.0);
+    buildEqNodes();               // 10밴드 EQ 노드(프리앰프 + 밴드) 생성
     spComp.connect(spMakeup);
-    spMakeup.connect(spDry); spMakeup.connect(spPre);
+    // 컴프 → 메이크업 → [프리앰프 → 밴드0..9] → 여기서 dry/reverb로 분기.
+    // EQ는 dry·wet(리버브) 양쪽에 모두 걸린다. 모든 이득 0dB면 사실상 무변화라 항상 물려둬도 안전.
+    spMakeup.connect(eqPreamp);
+    let prev = eqPreamp;
+    for (const b of eqBands) { prev.connect(b); prev = b; }
+    prev.connect(spDry); prev.connect(spPre);
     spPre.connect(spConv); spConv.connect(spWet);
     spDry.connect(actx.destination); spWet.connect(actx.destination);
     routeSpace(audio); routeSpace(spare);
     spaceReady = true;
+    applyEq();                    // 저장된 EQ 설정을 실제 노드에 반영
     return true;
   } catch (_) { spaceReady = false; return false; }
 }
 function reflectSpaceUI(mode) {
-  document.querySelectorAll("#fxrow .fx-btn").forEach((b) =>
+  // 공간감 버튼(off/soft/wide)만 토글한다. 같은 줄의 '평준화'(#fx-norm)는
+  // 별도 상태(reflectNormUI)라 건드리면 안 된다.
+  document.querySelectorAll("#fxrow .fx-btn[data-fx]").forEach((b) =>
     b.classList.toggle("active", b.dataset.fx === mode));
 }
 function applySpace(mode, save) {
@@ -790,13 +883,233 @@ function applyNormalize(on, save) {
   spMakeup.gain.value = 1.6;   // 눌린 큰음을 보상해 조용한 곡을 끌어올림
 }
 
+/* ───────────────────── 이퀄라이저 (10밴드 그래픽 EQ) ─────────────────────
+   PC(VLC 10밴드 EQ)와 같은 대역으로, 폰에선 Web Audio BiquadFilter 체인으로 구현.
+   양끝은 shelf, 가운데는 peaking 필터. 모든 이득 0dB면 소리가 그대로 통과(무변화)라
+   그래프에 항상 물려도 안전하다. 켜야만 사용자가 준 이득값을 실제로 건다. */
+const EQ_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+const EQ_PRESETS = {
+  "플랫":   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+  "팝":     [-1, 0, 2, 4, 4, 2, 0, -1, -1, -1],
+  "록":     [4, 3, 1, -1, -1, 1, 3, 4, 4, 4],
+  "재즈":   [3, 2, 1, 2, -1, -1, 0, 1, 2, 3],
+  "클래식": [4, 3, 2, 0, -1, -1, 0, 2, 3, 4],
+  "저음 강화": [6, 5, 4, 2, 0, -1, -1, -1, -1, -1],
+  "고음 강화": [-2, -2, -1, 0, 1, 2, 3, 4, 5, 5],
+  "보컬":   [-2, -1, 0, 2, 4, 4, 3, 1, 0, -1],
+};
+let eqEnabled = false, eqPreampDb = 0, eqGains = EQ_FREQS.map(() => 0);
+let eqPreamp = null, eqBands = null, eqApplied = false;
+const dbToGain = (db) => Math.pow(10, (db || 0) / 20);
+function buildEqNodes() {
+  eqPreamp = actx.createGain();
+  eqBands = EQ_FREQS.map((f, i) => {
+    const b = actx.createBiquadFilter();
+    b.type = i === 0 ? "lowshelf" : i === EQ_FREQS.length - 1 ? "highshelf" : "peaking";
+    b.frequency.value = f;
+    if (b.type === "peaking") b.Q.value = 1.1;
+    b.gain.value = 0;
+    return b;
+  });
+}
+function applyEq() {
+  if (!eqPreamp || !eqBands) return;
+  eqPreamp.gain.value = eqEnabled ? dbToGain(eqPreampDb) : 1;
+  eqBands.forEach((b, i) => { try { b.gain.value = eqEnabled ? (eqGains[i] || 0) : 0; } catch (_) {} });
+}
+function loadEqState() {
+  eqEnabled = !!LS.get("eq_on", "");
+  eqPreampDb = +LS.get("eq_pre", 0) || 0;
+  const g = LS.get("eq_gains", null);
+  if (Array.isArray(g) && g.length === EQ_FREQS.length) eqGains = g.map((v) => +v || 0);
+}
+function saveEqState() {
+  LS.set("eq_on", eqEnabled ? "1" : "");
+  LS.set("eq_pre", eqPreampDb);
+  LS.set("eq_gains", eqGains);
+}
+function reflectEqBtn() { const b = $("#fx-eq"); if (b) b.classList.toggle("active", eqEnabled); }
+function setEqEnabled(on) {
+  eqEnabled = !!on;
+  if (eqEnabled) {
+    if (!ensureSpaceGraph()) { toast("이 기기에선 EQ를 쓸 수 없어요."); eqEnabled = false; saveEqState(); reflectEqBtn(); return; }
+    if (actx.state === "suspended") actx.resume().catch(() => {});
+  }
+  saveEqState(); applyEq(); reflectEqBtn(); syncEqSheet();
+}
+function setEqBand(i, db) {
+  eqGains[i] = +db || 0; saveEqState();
+  if (eqEnabled && eqBands && eqBands[i]) { try { eqBands[i].gain.value = eqGains[i]; } catch (_) {} }
+}
+function setEqPreamp(db) {
+  eqPreampDb = +db || 0; saveEqState();
+  if (eqEnabled && eqPreamp) { try { eqPreamp.gain.value = dbToGain(eqPreampDb); } catch (_) {} }
+}
+function applyEqPreset(name) {
+  const p = EQ_PRESETS[name]; if (!p) return;
+  eqGains = p.slice();
+  if (!eqEnabled) { eqEnabled = true; if (!ensureSpaceGraph()) { eqEnabled = false; } else if (actx.state === "suspended") actx.resume().catch(() => {}); }
+  saveEqState(); applyEq(); reflectEqBtn(); syncEqSheet();
+}
+// EQ 바텀시트: 켜기 스위치 + 프리셋 칩 + 프리앰프/10밴드 슬라이더.
+function renderEqSheet() {
+  const chips = Object.keys(EQ_PRESETS).map((n) =>
+    `<button class="eq-chip" data-eqpreset="${escapeHtml(n)}">${escapeHtml(n)}</button>`).join("");
+  const freqLabel = (f) => (f >= 1000 ? (f / 1000) + "k" : "" + f);
+  const bands = EQ_FREQS.map((f, i) =>
+    `<div class="eq-band">
+       <input class="eq-slider" type="range" min="-12" max="12" step="1" value="${eqGains[i] || 0}" data-eqband="${i}" orient="vertical">
+       <div class="eq-band-val" data-eqval="${i}">${eqGains[i] > 0 ? "+" : ""}${eqGains[i] || 0}</div>
+       <div class="eq-band-freq">${freqLabel(f)}</div>
+     </div>`).join("");
+  $("#eq-body").innerHTML =
+    `<div class="eq-toprow">
+       <button class="eq-toggle${eqEnabled ? " on" : ""}" id="eq-toggle">${eqEnabled ? "켜짐" : "꺼짐"}</button>
+       <div class="eq-preamp">
+         <span>프리앰프</span>
+         <input id="eq-preamp" type="range" min="-12" max="12" step="1" value="${eqPreampDb}">
+         <span id="eq-preamp-val">${eqPreampDb > 0 ? "+" : ""}${eqPreampDb}dB</span>
+       </div>
+     </div>
+     <div class="eq-chips">${chips}</div>
+     <div class="eq-bands">${bands}</div>`;
+}
+function syncEqSheet() {
+  const s = $("#eq-sheet"); if (!s || s.hidden) return;
+  const tg = $("#eq-toggle"); if (tg) { tg.classList.toggle("on", eqEnabled); tg.textContent = eqEnabled ? "켜짐" : "꺼짐"; }
+  EQ_FREQS.forEach((f, i) => {
+    const sl = $(`[data-eqband="${i}"]`), v = $(`[data-eqval="${i}"]`);
+    if (sl) sl.value = eqGains[i] || 0;
+    if (v) v.textContent = (eqGains[i] > 0 ? "+" : "") + (eqGains[i] || 0);
+  });
+  const pa = $("#eq-preamp"), pav = $("#eq-preamp-val");
+  if (pa) pa.value = eqPreampDb;
+  if (pav) pav.textContent = (eqPreampDb > 0 ? "+" : "") + eqPreampDb + "dB";
+}
+function openEqSheet() {
+  renderEqSheet();
+  const s = $("#eq-sheet"); s.hidden = false;
+  requestAnimationFrame(() => s.classList.add("open"));
+  try { history.pushState({ taEq: 1 }, ""); } catch (_) {}
+}
+function closeEqSheet() {
+  const s = $("#eq-sheet"); s.classList.remove("open");
+  setTimeout(() => { s.hidden = true; }, 200);
+}
+
+/* ───────────────────── 슬립 타이머 ─────────────────────
+   일정 시간(또는 '이 곡 끝나면') 뒤에 자동으로 재생을 멈춘다. 잠들기 전 음악용. */
+function setSleep(min) {
+  clearTimeout(sleepTimer); clearInterval(sleepTick);
+  sleepTimer = null; sleepTick = null; sleepAfterTrack = false; sleepEndAt = 0;
+  if (min === "track") { sleepAfterTrack = true; reflectSleep(); toast("이 곡이 끝나면 정지합니다."); closeSleepSheet(); return; }
+  if (!min) { reflectSleep(); toast("타이머를 껐습니다."); closeSleepSheet(); return; }
+  sleepEndAt = Date.now() + min * 60000;
+  sleepTimer = setTimeout(sleepFire, min * 60000);
+  sleepTick = setInterval(reflectSleep, 15000);
+  reflectSleep(); toast(`${min}분 후 정지합니다.`); closeSleepSheet();
+}
+function sleepFire() {
+  clearInterval(sleepTick); sleepTick = null; sleepTimer = null; sleepEndAt = 0;
+  fadeOutAndPause(); reflectSleep(); toast("타이머로 정지했습니다.");
+}
+// 부드럽게 볼륨을 줄이며 멈춘다(볼륨 조절 불가 기기는 즉시 정지).
+function fadeOutAndPause() {
+  if (!crossfadeOK) { audio.pause(); return; }
+  let v = audio.volume;
+  const iv = setInterval(() => {
+    v -= 0.05; try { audio.volume = Math.max(0, v); } catch (_) {}
+    if (v <= 0) { clearInterval(iv); audio.pause(); try { audio.volume = 1; } catch (_) {} }
+  }, 80);
+}
+function reflectSleep() {
+  const b = $("#fx-sleep"); if (!b) return;
+  if (sleepAfterTrack) { b.classList.add("active"); b.textContent = "🌙곡"; return; }
+  if (sleepEndAt) { const m = Math.max(0, Math.ceil((sleepEndAt - Date.now()) / 60000)); b.classList.add("active"); b.textContent = "🌙" + m; return; }
+  b.classList.remove("active"); b.textContent = "🌙";
+}
+function openSleepSheet() {
+  const s = $("#sleep-sheet"); s.hidden = false;
+  requestAnimationFrame(() => s.classList.add("open"));
+  try { history.pushState({ taSleep: 1 }, ""); } catch (_) {}
+}
+function closeSleepSheet() {
+  const s = $("#sleep-sheet"); if (!s) return; s.classList.remove("open");
+  setTimeout(() => { s.hidden = true; }, 200);
+}
+
+/* ───────────────────── 이어듣기(마지막 곡·재생 위치) ─────────────────────
+   PC의 '마지막 곡 이어재생'처럼, 앱을 다시 열면 마지막 곡을 위치까지 복원한다.
+   자동재생은 브라우저가 막으므로 미니바에 곡을 올려두고, 재생을 누르면 그 위치부터. */
+function saveResume(force) {
+  if (curIndex < 0) return;
+  const now = Date.now();
+  if (!force && now - resumeSaveT < 4000) return;
+  resumeSaveT = now;
+  const t = library[curIndex]; if (!t) return;
+  LS.set("resume", { rel: t.rel, pos: audio.currentTime || 0 });
+}
+function restoreResume() {
+  if (curIndex >= 0) return;                 // 이미 재생/복원됨
+  const r = LS.get("resume", null); if (!r || !r.rel) return;
+  const t = trackByRel(r.rel); if (!t) return;
+  const idx = library.findIndex((x) => x.id === t.id); if (idx < 0) return;
+  curIndex = idx; resumeTrackId = t.id; pendingSeek = r.pos || 0;
+  $("#mini").hidden = false;
+  setNowPlaying({ title: t.title, artist: t.artist, album: t.album || "", year: t.year, genre: t.genre, cover: null });
+  $("#mini-play").textContent = "▶"; $("#btn-play").textContent = "▶";
+  updateMediaSession(t.title, t.artist, t.album || "", null);
+  getCachedCover(t).then((url) => {
+    if (!url || curIndex !== idx) { url && URL.revokeObjectURL(url); return; }
+    curCoverUrl = url; shownCoverForId = t.id;
+    setCoverImg("#cover", url); setCoverImg("#mini-art", url);
+  });
+}
+
+/* ───────────────────── 통계 ─────────────────────
+   라이브러리 태그로 아티스트·장르·연대 분포를 막대그래프로 보여준다(PC 통계와 결 맞춤). */
+function barChart(title, entries) {
+  if (!entries.length) return "";
+  const max = Math.max(...entries.map((e) => e[1]));
+  const rows = entries.map(([k, v]) => `
+    <div class="stat-row">
+      <div class="stat-key">${escapeHtml(k)}</div>
+      <div class="stat-bar"><span style="width:${Math.max(3, Math.round(v / max * 100))}%"></span></div>
+      <div class="stat-val">${v}</div>
+    </div>`).join("");
+  return `<div class="stat-block"><h3>${escapeHtml(title)}</h3>${rows}</div>`;
+}
+function renderStats() {
+  const box = $("#stats-body"); if (!box) return;
+  const enr = library.filter((t) => t.enriched);
+  if (!enr.length) {
+    box.innerHTML = `<div class="entries-empty">아직 곡 정보를 읽는 중입니다.<br>잠시 후 다시 열어보세요.<br>(곡 탭의 '곡 정보 읽기'로 앞당길 수 있어요)</div>`;
+    return;
+  }
+  const tally = (fn) => { const m = new Map(); for (const t of enr) { const v = fn(t); if (!v) continue; m.set(v, (m.get(v) || 0) + 1); } return m; };
+  const byCount = (m) => [...m.entries()].sort((a, b) => b[1] - a[1]);
+  const artists = byCount(tally((t) => t.artist)).slice(0, 12);
+  const genres = byCount(tally((t) => t.genre)).slice(0, 10);
+  const decMap = tally((t) => { const y = parseInt(t.year); return y ? `${Math.floor(y / 10) * 10}` : ""; });
+  const decades = [...decMap.entries()].sort((a, b) => parseInt(a[0]) - parseInt(b[0])).map(([k, v]) => [k + "년대", v]);
+  box.innerHTML =
+    `<div class="stat-summary">${library.length}곡 · 아티스트 ${tally((t) => t.artist).size} · 앨범 ${tally((t) => t.album).size} · 장르 ${tally((t) => t.genre).size}</div>`
+    + barChart("아티스트 TOP", artists)
+    + barChart("장르", genres)
+    + barChart("연대", decades)
+    + (enr.length < library.length ? `<div class="stat-note">${library.length - enr.length}곡은 아직 정보를 읽는 중이라 통계에서 빠졌습니다.</div>` : "");
+}
+
 async function playByLibIndex(i, opts = {}) {
   if (i < 0 || i >= library.length) return;
   advancing = false;                 // 자동 크로스페이드 예약 해제(새 곡 시작)
+  // 이어듣기: 복원된 그 곡을 시작할 때만 저장 위치로 시크한다. 다른 곡을 고르면 시크 취소.
+  if (resumeTrackId) { if (!(library[i] && library[i].id === resumeTrackId)) pendingSeek = null; resumeTrackId = null; }
   curIndex = i;
   // 저장된 공간감·음량 평준화 설정을 첫 재생(=사용자 제스처) 때 한 번 실제로 건다.
   if (!spaceApplied) { spaceApplied = true; const m = LS.get("space_fx", "off"); if (m !== "off") applySpace(m, false); }
   if (!normApplied) { normApplied = true; if (LS.get("norm_fx", "")) applyNormalize(true, false); }
+  if (!eqApplied) { eqApplied = true; if (eqEnabled) ensureSpaceGraph(); }   // 저장된 EQ를 첫 재생 때 그래프에 반영
   const track = library[i];
   $("#mini").hidden = false;
   // 정보는 태그에서 온 것만 보여준다. 아직 태그를 안 읽은 곡이면 추정값(파일명)을
@@ -934,6 +1247,8 @@ function syncLyrics() {
   }
 }
 function nextTrack(auto) {
+  // 슬립 타이머 '이 곡 끝나면': 자동 넘김 시점에 다음 곡으로 가지 않고 정지한다.
+  if (auto && sleepAfterTrack) { sleepAfterTrack = false; reflectSleep(); stopPlayback(); return; }
   if (repeat === "one" && auto) { audio.currentTime = 0; audio.play(); return; }
   // 사용자 지정 재생큐(다음에 재생/큐에 추가)를 가장 먼저 소비한다. 플레이리스트 재생
   // 중이면 그 곡을 '끼워' 재생하고, 큐가 비면 원래 플레이리스트가 이어진다(plQueue 유지).
@@ -967,6 +1282,8 @@ function prevTrack() {
 }
 function togglePlay() {
   if (curIndex < 0 && library.length) return playByLibIndex(0);
+  // 이어듣기로 곡만 복원된 상태(아직 스트림을 안 붙임) → 저장 위치부터 실제 재생 시작.
+  if (!audio.src) { if (curIndex >= 0) playByLibIndex(curIndex); return; }
   if (audio.paused) { audio.play(); return; }
   // 페이드 도중 일시정지: 페이드를 즉시 끝내고(활성 요소만 남김) 멈춘다.
   if (fadeTimer) { clearFade(); try { spare.pause(); spare.removeAttribute("src"); audio.volume = 1; } catch (_) {} }
@@ -997,7 +1314,7 @@ function updateMediaSession(title, artist, album, cover) {
     });
   } catch (_) {}
   const set = (a, fn) => { try { navigator.mediaSession.setActionHandler(a, fn); } catch (_) {} };
-  set("play", () => audio.play());
+  set("play", () => { if (!audio.src && curIndex >= 0) playByLibIndex(curIndex); else audio.play(); });
   set("pause", () => audio.pause());
   set("previoustrack", prevTrack);
   set("nexttrack", () => nextTrack(false));
@@ -1590,6 +1907,7 @@ function switchTab(tab) {
   $$(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   $$(".tabview").forEach((v) => (v.hidden = v.dataset.view !== tab));
   if (tab === "playlists") renderPlaylists();
+  if (tab === "stats") renderStats();
 }
 
 /* ───────────────────── 태그 캐시 / 읽기 ───────────────────── */
@@ -1725,6 +2043,7 @@ async function loadLibrary(forceRefresh) {
   if (cached && !forceRefresh) {
     library = cached; applySearch();
     status.textContent = `${library.length}곡 (캐시) · ⟳ 로 새로고침`;
+    restoreResume();   // 마지막에 듣던 곡을 미니바에 복원(이어듣기)
     syncPlaylists();   // 라이브러리 준비됨 → 플레이리스트 동기화(rel 매핑 필요)
     enrichAllBg();     // 캐시에 아직 태그 없는 곡이 있으면 백그라운드로 마저 채운다
     setTimeout(probeCoverStore, 800);   // 커버 로딩 방식 진단(한 번)
@@ -1751,6 +2070,7 @@ async function loadLibrary(forceRefresh) {
     status.textContent = `${library.length}곡` + (missing.length ? ` · ⚠️ 못 찾은 폴더: ${missing.join(", ")}` : "");
     plParentId = rootIds[0];           // 공용 플레이리스트 파일을 둘 음악 루트 폴더
     LS.set("pl_parent", plParentId);   // 캐시 로드 시 재사용
+    restoreResume();                   // 마지막에 듣던 곡을 미니바에 복원(이어듣기)
     syncPlaylists();                   // 플레이리스트 PC와 동기화
     enrichAllBg();                     // 전 곡 태그를 백그라운드로 미리 읽어 캐시(처음부터 실제 태그)
     setTimeout(probeCoverStore, 800);   // 커버 로딩 방식 진단(한 번)
@@ -1841,6 +2161,7 @@ function bind() {
   });
   $$(".vt-btn").forEach((b) => b.addEventListener("click", () => {
     viewMode = b.dataset.viewMode;
+    selectedAlbum = null;   // 보기 전환 시 앨범 상세는 닫음
     $$(".vt-btn").forEach((x) => x.classList.toggle("active", x === b));
     applySearch();
   }));
@@ -1854,14 +2175,15 @@ function bind() {
   $("#track-list").addEventListener("click", (e) => {
     const add = e.target.closest("[data-add]");
     if (add) { e.stopPropagation(); const t = library.find((x) => x.id === add.dataset.add); if (t) addTrackToPlaylist(t); return; }
+    // 앨범 상세 뷰의 버튼/곡
+    if (e.target.closest("#ad-back")) { selectedAlbum = null; renderAlbums(); return; }
+    if (e.target.closest("#ad-playall")) { albumPlay(false); return; }
+    if (e.target.closest("#ad-shuffle")) { albumPlay(true); return; }
+    const adRow = e.target.closest(".ad-tracks .track");
+    if (adRow) { albumPlayFrom(adRow.dataset.id); return; }
+    // 앨범 카드 → 상세(곡 목록) 열기
     const card = e.target.closest(".album-card");
-    if (card) {
-      const firstId = card.dataset.ids.split(",")[0];
-      plQueue = null;   // 라이브러리에서 직접 재생 → 플레이리스트 큐 해제
-      playByLibIndex(library.findIndex((t) => t.id === firstId));
-      openPlayer();
-      return;
-    }
+    if (card) { selectedAlbum = card.dataset.album; renderAlbums(); return; }
     const li = e.target.closest(".track"); if (!li) return;
     plQueue = null;
     playByLibIndex(library.findIndex((t) => t.id === li.dataset.id));
@@ -1967,10 +2289,13 @@ function bind() {
   //  · 어느 경우든 히스토리 트랩을 다시 세워 '이전'으로 앱이 종료되지 않게 함
   //  → 완전히 끄려면 홈(백그라운드 재생 유지) 또는 '최근 앱'에서 밀기.
   window.addEventListener("popstate", () => {
+    if (!$("#eq-sheet").hidden) { closeEqSheet(); pushGuard(); return; }   // EQ 시트 먼저 닫기
+    if (!$("#sleep-sheet").hidden) { closeSleepSheet(); pushGuard(); return; }   // 슬립 시트 먼저 닫기
     if (!$("#upnext-sheet").hidden) { closeUpNext(); pushGuard(); return; }   // 재생큐 시트 먼저 닫기
     if (!$("#pl-choose").hidden) { closePlaylistChooser(); pushGuard(); return; }   // 담기 시트 먼저 닫기
     if (!$("#pl-picker").hidden) { closeAddPicker(); pushGuard(); return; }   // 피커 먼저 닫기
     if (!$("#player").hidden) { closePlayerUI(); pushGuard(); return; }
+    if (selectedAlbum && activeTab === "library" && viewMode === "album") { selectedAlbum = null; renderAlbums(); pushGuard(); return; }   // 앨범 상세 닫기
     if (selectedPlaylistId && activeTab === "playlists") { selectedPlaylistId = null; renderPlaylists(); pushGuard(); return; }
     if (!LS.get("back_hint", false)) {   // 메인에서 첫 '이전' 때 한 번만 안내
       toast("홈 버튼으로 나가면 음악이 계속 재생됩니다");
@@ -1990,23 +2315,69 @@ function bind() {
   $("#btn-play").addEventListener("click", togglePlay);
   $("#btn-next").addEventListener("click", () => nextTrack(false));
   $("#btn-prev").addEventListener("click", prevTrack);
-  $("#btn-shuffle").addEventListener("click", (e) => { shuffle = !shuffle; e.currentTarget.classList.toggle("dim", !shuffle); });
+  $("#btn-shuffle").addEventListener("click", (e) => {
+    shuffle = !shuffle; LS.set("shuffle", shuffle);
+    e.currentTarget.classList.toggle("dim", !shuffle);
+  });
   $("#btn-repeat").addEventListener("click", (e) => {
     repeat = repeat === "off" ? "all" : repeat === "all" ? "one" : "off";
+    LS.set("repeat", repeat);
     e.currentTarget.textContent = repeat === "one" ? "🔂" : "🔁";
     e.currentTarget.classList.toggle("dim", repeat === "off");
   });
-  $("#btn-shuffle").classList.add("dim"); $("#btn-repeat").classList.add("dim");
+  // 저장된 셔플/반복 상태 복원(세션 간 유지).
+  shuffle = !!LS.get("shuffle", false);
+  repeat = LS.get("repeat", "off"); if (!["off", "all", "one"].includes(repeat)) repeat = "off";
+  $("#btn-shuffle").classList.toggle("dim", !shuffle);
+  $("#btn-repeat").textContent = repeat === "one" ? "🔂" : "🔁";
+  $("#btn-repeat").classList.toggle("dim", repeat === "off");
 
   // 공간감/울림 효과 — 클릭은 사용자 제스처라 AudioContext resume이 허용된다.
-  const fxrow = $("#fxrow");
-  if (fxrow) fxrow.addEventListener("click", (e) => {
+  // 효과 버튼(공간감/평준화/EQ/슬립)은 두 줄(#fxrow, .fxrow2)에 걸쳐 있으므로
+  // 공통 부모(.controls)에서 위임 처리한다. .fx-btn이 아니면 무시.
+  const ctlBox = $(".controls");
+  if (ctlBox) ctlBox.addEventListener("click", (e) => {
     const b = e.target.closest(".fx-btn"); if (!b) return;
+    if (b.id === "fx-eq") { openEqSheet(); return; }
+    if (b.id === "fx-sleep") { openSleepSheet(); return; }
     if (b.id === "fx-norm") { applyNormalize(!b.classList.contains("active"), true); return; }
-    applySpace(b.dataset.fx, true);
+    if (b.dataset.fx) applySpace(b.dataset.fx, true);
   });
   reflectSpaceUI(LS.get("space_fx", "off"));   // 저장된 설정 표시(그래프는 첫 재생/토글 때 생성)
   reflectNormUI(!!LS.get("norm_fx", ""));
+  loadEqState(); reflectEqBtn(); reflectSleep();   // 저장된 EQ 상태 표시(그래프는 첫 재생/토글 때)
+
+  // 이퀄라이저 바텀시트
+  const closeEq = () => { if (history.state && history.state.taEq) history.back(); else closeEqSheet(); };
+  $("#eq-close").addEventListener("click", closeEq);
+  $("#eq-sheet .sheet-backdrop").addEventListener("click", closeEq);
+  $("#eq-body").addEventListener("click", (e) => {
+    if (e.target.closest("#eq-toggle")) { setEqEnabled(!eqEnabled); return; }
+    const p = e.target.closest("[data-eqpreset]"); if (p) { applyEqPreset(p.dataset.eqpreset); return; }
+  });
+  $("#eq-body").addEventListener("input", (e) => {
+    const band = e.target.closest("[data-eqband]");
+    if (band) { const i = +band.dataset.eqband; setEqBand(i, band.value); const v = $(`[data-eqval="${i}"]`); if (v) v.textContent = (band.value > 0 ? "+" : "") + band.value; return; }
+    if (e.target.id === "eq-preamp") { setEqPreamp(e.target.value); const pv = $("#eq-preamp-val"); if (pv) pv.textContent = (e.target.value > 0 ? "+" : "") + e.target.value + "dB"; }
+  });
+
+  // 슬립 타이머 바텀시트
+  const closeSleep = () => { if (history.state && history.state.taSleep) history.back(); else closeSleepSheet(); };
+  $("#sleep-close").addEventListener("click", closeSleep);
+  $("#sleep-sheet .sheet-backdrop").addEventListener("click", closeSleep);
+  $("#sleep-opts").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-sleep]"); if (!b) return;
+    const v = b.dataset.sleep;
+    setSleep(v === "off" ? 0 : v === "track" ? "track" : parseInt(v));
+  });
+
+  // 가사 줄 탭 → 그 구간으로 이동(PC의 '가사 클릭 시크'와 동일).
+  $("#lyrics").addEventListener("click", (e) => {
+    const line = e.target.closest(".ly-line"); if (!line || !Array.isArray(lyrics)) return;
+    const ln = lyrics[+line.dataset.i]; if (!ln) return;
+    try { audio.currentTime = Math.max(0, ln.t / 1000); } catch (_) {}
+    if (audio.paused && audio.src) audio.play().catch(() => {});
+  });
 
   // 시크바
   const seek = $("#seek");
@@ -2034,9 +2405,15 @@ function bindAudioEvents(el) {
     $("#mini-play").textContent = "▶"; $("#btn-play").textContent = "▶";
     if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
     killReverbTail();    // 멈추면 울림 꼬리가 계속 울리지 않게 즉시 끊음
+    saveResume(true);    // 멈춘 위치를 이어듣기용으로 저장
   });
   el.addEventListener("ended", function () { if (this === audio) nextTrack(true); });
-  el.addEventListener("loadedmetadata", function () { if (this === audio) updatePositionState(); });
+  el.addEventListener("loadedmetadata", function () {
+    if (this !== audio) return;
+    // 이어듣기 복원: 첫 재생 시 저장해 둔 위치로 한 번 시크한다.
+    if (pendingSeek != null) { try { if (pendingSeek > 0 && pendingSeek < (audio.duration || 0) - 1) audio.currentTime = pendingSeek; } catch (_) {} pendingSeek = null; }
+    updatePositionState();
+  });
   el.addEventListener("timeupdate", function () {
     if (this !== audio) return;
     const seek = $("#seek");
@@ -2044,7 +2421,7 @@ function bindAudioEvents(el) {
     if (!seeking && d) { seek.value = Math.round((c / d) * 1000); $("#cur-time").textContent = fmtTime(c); }
     $("#dur-time").textContent = fmtTime(d);
     $("#mini-prog").firstElementChild.style.width = d ? (c / d * 100) + "%" : "0";
-    if (++posTick % 8 === 0) updatePositionState();   // 약 2초마다 잠금화면 진행바 갱신
+    if (++posTick % 8 === 0) { updatePositionState(); saveResume(false); }   // 약 2초마다 진행바·이어듣기 갱신
     // 곡 끝 CROSSFADE_MS 전에 다음 곡으로 미리 넘어가 겹치게 한다(AIMP식).
     // 볼륨 조절이 되는 기기에서만(iOS는 즉시 전환). repeat one은 제외.
     if (crossfadeOK && !advancing && repeat !== "one" && d && c > 1
