@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v32";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v33";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -1442,17 +1442,18 @@ async function findPlaylistFile() {
   plFileId = (data.files && data.files[0]) ? data.files[0].id : null;
   return plFileId;
 }
+// ‼ 예전엔 모든 오류를 [] 로 삼켜서, 네트워크가 끊겨도 "이미 최신입니다"라고 답했다.
+//   이제 '파일 없음'만 [] 이고 나머지 실패는 던진다 → 호출부가 noteSync 로 기록한다.
 async function readSharedItems() {
-  try {
-    const id = await findPlaylistFile();
-    if (!id) return [];
-    const token = await ensureToken();
-    const r = await fetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`,
-      { headers: { Authorization: "Bearer " + token }, cache: "no-store" });
-    if (!r.ok) return [];
-    const doc = await r.json();
-    return (doc && Array.isArray(doc.items)) ? doc.items : [];
-  } catch (_) { return []; }
+  const id = await findPlaylistFile();
+  if (!id) return [];
+  const token = await ensureToken();
+  const r = await fetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`,
+    { headers: { Authorization: "Bearer " + token }, cache: "no-store" });
+  if (r.status === 404) { plFileId = null; return []; }
+  if (!r.ok) throw new Error("Drive " + r.status);
+  const doc = await r.json().catch(() => null);
+  return (doc && Array.isArray(doc.items)) ? doc.items : [];
 }
 // 공용 파일 저장(있으면 PATCH, 없으면 음악 폴더에 생성). 권한 없으면 한 번 동의받고 재시도.
 async function writeSharedItems(items) {
@@ -1521,7 +1522,8 @@ async function syncPlaylists() {
     LS.set("pl_items", plItems());
     await writeSharedItems(plItems());   // 폰이 파일을 만들거나 갱신(양쪽 수렴)
     plSynced = true;
-  } catch (_) { /* 오프라인/권한 거부면 로컬만 사용 */ }
+    noteSync(true, `시작 동기화 · 목록 ${playlists.length}개`);
+  } catch (e) { noteSync(false, "", navigator.onLine ? e : "오프라인 — 폰에 저장된 목록만 사용"); }
   if (activeTab === "playlists") renderPlaylists();
   prefetchPlaylistCovers();   // 각 플레이리스트 첫 곡 커버를 미리 받아 목록 탭이 즉시 채워지게
 }
@@ -1542,7 +1544,8 @@ async function prefetchPlaylistCovers() {
 // 새로고침 버튼: 공용 파일(_playlists.json)만 다시 읽어 PC 변경을 즉시 반영.
 // 라이브러리는 다시 안 읽으므로 빠르다(rel 매핑은 이미 있음).
 let plRefreshing = false;
-async function refreshPlaylists() {
+async function refreshPlaylists(silent) {
+  silent = silent === true;   // 클릭 핸들러로 붙으면 이벤트 객체가 들어온다
   if (plRefreshing) return;
   plRefreshing = true;
   document.querySelectorAll("#btn-pl-refresh, #pl-refresh-btn").forEach((b) => b.classList.add("spinning"));
@@ -1553,9 +1556,12 @@ async function refreshPlaylists() {
     LS.set("pl_items", plItems());
     await writeSharedItems(plItems());   // 양쪽 수렴(폰 로컬 변경도 함께 반영)
     if (activeTab === "playlists") renderPlaylists();
-    toast(JSON.stringify(plItems()) === before ? "이미 최신입니다." : "PC 변경 내용을 불러왔어요.");
-  } catch (_) {
-    toast("불러오지 못했습니다. 네트워크를 확인하세요.");
+    const same = JSON.stringify(plItems()) === before;
+    noteSync(true, same ? "변경 없음" : "PC 변경 반영");
+    if (!silent) toast(same ? "이미 최신입니다." : "PC 변경 내용을 불러왔어요.");
+  } catch (e) {
+    noteSync(false, "", e);
+    if (!silent) toast("동기화하지 못했습니다 — 설정 › PC 동기화에서 원인을 볼 수 있어요.");
   } finally {
     plRefreshing = false;
     document.querySelectorAll("#btn-pl-refresh, #pl-refresh-btn").forEach((b) => b.classList.remove("spinning"));
@@ -1572,8 +1578,185 @@ function savePlaylists() {
       plFromItems(merged); LS.set("pl_items", plItems());
       await writeSharedItems(plItems());
       if (activeTab === "playlists") renderPlaylists();
-    } catch (_) {}
+      noteSync(true, "폰 변경 저장");
+    } catch (e) { noteSync(false, "", e); }
   }, 800);
+}
+
+/* ───────────────────── 동기화 상태 · 설정 화면 ─────────────────────
+   학습 앱(Templum Sapientiae) 설정 화면을 본떴다: 장식이 아니라 **조용한 실패를 드러내는 곳**.
+   행은 [이름, 값, 톤(good|warn|off)] 으로 그리고, 동기화는 성공·실패를 모두 기록한다. */
+const SYNC_KEY = "sync_state";   // {lastTry, lastOk, lastResult, lastError}
+const SYNC_LOG = "sync_log";     // 최근 30건 [{ts, ok, msg}]
+const AUTO_SYNC_GAP = 5 * 60 * 1000;
+function noteSync(ok, what, err) {
+  const s = LS.get(SYNC_KEY, {}), now = Date.now();
+  s.lastTry = now;
+  if (ok) { s.lastOk = now; s.lastResult = what; s.lastError = ""; }
+  else s.lastError = String((err && err.message) || err || "실패");
+  LS.set(SYNC_KEY, s);
+  const log = LS.get(SYNC_LOG, []);
+  log.unshift({ ts: now, ok, msg: ok ? what : s.lastError });
+  LS.set(SYNC_LOG, log.slice(0, 30));
+  if (activeTab === "settings") renderSettings();
+}
+// 앱을 다시 볼 때·연결이 돌아올 때 조용히 동기화(학습 앱 wireUplink 와 같은 취지). 5분 간격 이내.
+function autoSync() {
+  if (!plSynced || !navigator.onLine || !tokenFresh()) return;
+  if (Date.now() - (LS.get(SYNC_KEY, {}).lastOk || 0) < AUTO_SYNC_GAP) return;
+  refreshPlaylists(true);
+}
+function when(ts) {
+  if (!ts) return "없음";
+  const d = Date.now() - ts;
+  if (d < 60e3) return "방금";
+  if (d < 3600e3) return `${Math.floor(d / 60e3)}분 전`;
+  if (d < 86400e3) return `${Math.floor(d / 3600e3)}시간 전`;
+  return `${Math.floor(d / 86400e3)}일 전`;
+}
+const setRows = (rows) => rows.map(([k, v, tone]) =>
+  `<div class="set-row"><span class="k">${escapeHtml(k)}</span><span class="v ${tone || ""}">${escapeHtml(v)}</span></div>`).join("");
+const setBtn = (act, label) => `<button class="btn-mini" data-act="${act}">${escapeHtml(label)}</button>`;
+const setCard = (title, body) => `<section class="set-card"><h3>${escapeHtml(title)}</h3>${body}</section>`;
+let crossfadeOn = LS.get("crossfade", true);
+
+async function renderSettings() {
+  const box = $("#settings-body"); if (!box) return;
+  let storage = "알 수 없음";
+  try {
+    const e = await navigator.storage?.estimate?.();
+    if (e) storage = `${(e.usage / 1048576).toFixed(0)}MB / ${(e.quota / 1073741824).toFixed(1)}GB`;
+  } catch (_) {}
+  const s = LS.get(SYNC_KEY, {});
+  const signed = LS.get("signed_in", false);
+  const email = LS.get("account_email", "");
+  const left = tokenExp - Date.now();
+  const enriched = library.filter((t) => t.enriched).length;
+  const tombs = Object.keys(plTombs).length;
+  const log = LS.get(SYNC_LOG, []).slice(0, 8);
+  const okAge = s.lastOk ? Date.now() - s.lastOk : Infinity;
+  const keepFolders = document.activeElement?.id === "set-folders";   // 입력 중이면 덮어쓰지 않는다
+  const folderText = keepFolders ? $("#set-folders").value : getFolderPaths().join("\n");
+  box.innerHTML =
+    setCard("연결", setRows([
+      ["네트워크", navigator.onLine ? "온라인" : "오프라인", navigator.onLine ? "good" : "off"],
+      ["계정", email || "확인 전", email ? "good" : ""],
+      ["인증", tokenFresh() ? `유효 · ${Math.max(1, Math.round(left / 60e3))}분 남음`
+        : signed ? "만료 — 화면을 누르면 갱신" : "로그인 안 됨",
+        tokenFresh() ? "good" : signed ? "warn" : "off"],
+    ]) + `<div class="set-actions">${setBtn("renew", "다시 연결")}${setBtn("signout", "로그아웃")}</div>`)
+    + setCard("PC 동기화 (재생목록)", setRows([
+      ["마지막 성공", s.lastOk ? `${when(s.lastOk)} · ${s.lastResult || ""}` : "없음",
+        okAge < 86400e3 ? "good" : s.lastOk ? "warn" : "off"],
+      ["마지막 오류", s.lastError ? `${when(s.lastTry)} · ${s.lastError}` : "없음", s.lastError ? "warn" : "good"],
+      ["공유 파일", plFileId ? `${PL_FILE} 있음` : plSynced ? "아직 없음(첫 저장 때 생성)" : "확인 전", plFileId ? "good" : ""],
+      ["재생목록", `${playlists.length}개 · 삭제 기록 ${tombs}건`, ""],
+    ]) + `<div class="set-actions">${setBtn("sync", "지금 동기화")}${setBtn("probe", "연결 점검")}</div>`
+      + `<div id="set-probe">${setRows(probeRows)}</div>`
+      + (log.length ? `<div class="set-log">${log.map((l) =>
+        `<div class="${l.ok ? "" : "bad"}">${when(l.ts)} · ${escapeHtml(l.msg || "")}</div>`).join("")}</div>` : "")
+      + `<p class="set-note">PC와는 음악 폴더의 <b>${PL_FILE}</b> 하나로 주고받습니다. 앱을 다시 열거나 인터넷이 돌아오면 자동으로 맞춥니다.</p>`)
+    + setCard("음악 폴더", setRows([
+      ["곡", `${library.length.toLocaleString()}곡 · 정보 읽음 ${enriched.toLocaleString()}`, library.length ? "good" : "warn"],
+    ]) + `<textarea id="set-folders" class="set-text" rows="3" spellcheck="false">${escapeHtml(folderText)}</textarea>`
+      + `<p class="set-note">한 줄에 하나. 재생목록 공유 파일은 <b>첫 번째 폴더</b>에 둡니다.</p>`
+      + `<div class="set-actions">${setBtn("folders", "저장하고 다시 읽기")}${setBtn("rescan", "곡 목록 다시 읽기")}</div>`)
+    + setCard("재생", `
+      <label class="set-toggle"><span>곡 전환 크로스페이드</span>
+        <input type="checkbox" data-opt="crossfade" ${crossfadeOn && crossfadeOK ? "checked" : ""} ${crossfadeOK ? "" : "disabled"}></label>
+      ${crossfadeOK ? "" : `<p class="set-note">이 기기는 음량 조절을 지원하지 않아 크로스페이드를 쓸 수 없습니다.</p>`}
+      <label class="set-toggle"><span>음량 평준화</span>
+        <input type="checkbox" data-opt="norm" ${LS.get("norm_fx", "") ? "checked" : ""}></label>
+      <div class="set-actions">${setBtn("eq", "이퀄라이저 열기")}</div>`)
+    + setCard("저장공간", setRows([
+      ["사용량", storage, ""],
+      ["커버 캐시", `${LS.get(COVER_KEYS, []).length}개`, ""],
+    ]) + `<div class="set-actions">${setBtn("clear-covers", "커버 캐시 비우기")}</div>`)
+    + setCard("앱 정보", setRows([
+      ["버전", APP_VERSION, "good"],
+      ["Client ID", CLIENT_ID ? CLIENT_ID.slice(0, 14) + "…" : "없음", CLIENT_ID ? "" : "warn"],
+    ]) + `<div class="set-actions">${setBtn("update", "업데이트 확인")}${setBtn("client", "Client ID 변경")}</div>`);
+  if (keepFolders) $("#set-folders")?.focus();
+}
+
+// 단계별 연결 점검 — 어디서 막히는지 한 줄씩(학습 앱 probe 와 같은 방식).
+let probeRows = [];   // 마지막 점검 결과 — 화면을 다시 그려도 남게 모듈에 둔다
+async function probeSync() {
+  const out = $("#set-probe"); if (!out) return;
+  const rows = probeRows = [];
+  const show = () => { const o = $("#set-probe"); if (o) o.innerHTML = setRows(rows); };
+  const step = async (name, fn) => {
+    try { const v = await fn(); rows.push([name, v || "OK", "good"]); show(); return true; }
+    catch (e) { rows.push([name, String(e.message || e), "warn"]); show(); return false; }
+  };
+  if (!await step("① 인터넷", async () => { if (!navigator.onLine) throw new Error("오프라인"); })) return;
+  if (!await step("② 로그인", async () => { if (!tokenFresh()) await requestToken(false); return LS.get("account_email", "") || "OK"; })) return;
+  if (!await step("③ 음악 폴더", async () => {
+    const path = getFolderPaths()[0];
+    const id = await resolveFolderPath(path);
+    if (!id) throw new Error("첫 번째 폴더를 찾지 못함: " + path);
+    plParentId = id; LS.set("pl_parent", id); return path;
+  })) return;
+  if (!await step("④ 공유 파일 읽기", async () => {
+    const items = await readSharedItems();
+    return plFileId ? `${items.filter((i) => !i.deleted).length}개 목록` : "아직 없음(쓰기 때 생성)";
+  })) return;
+  await step("⑤ 쓰기", async () => {
+    plFromItems(mergeItems(plItems(), await readSharedItems(), Date.now()));
+    LS.set("pl_items", plItems());
+    await writeSharedItems(plItems());
+    return "OK";
+  });
+  if (rows.every((r) => r[2] === "good")) noteSync(true, "연결 점검 통과");
+  show();
+}
+
+async function onSettingsAction(act) {
+  if (act === "renew") {
+    if (tokenFresh()) toast("이미 연결돼 있습니다.");
+    else { try { await requestToken(false); toast("다시 연결했습니다."); } catch (e) { toast("연결 실패: " + e.message); } }
+  } else if (act === "signout") {
+    if (confirm("로그아웃할까요? 폰에 저장된 목록은 그대로 남습니다.")) signOut();
+    return;
+  } else if (act === "sync") {
+    await refreshPlaylists(false);
+  } else if (act === "probe") {
+    await probeSync(); return;
+  } else if (act === "folders") {
+    const fp = ($("#set-folders").value || "").split("\n").map((x) => x.trim()).filter(Boolean);
+    if (!fp.length) return toast("폴더를 한 줄 이상 적어 주세요.");
+    setFolderPaths(fp);
+    plParentId = null; plFileId = null; LS.set("pl_parent", null);   // 첫 폴더가 바뀌면 공유 파일 위치도 바뀐다
+    $("#set-folders").blur();
+    toast("폴더를 저장했습니다. 곡 목록을 다시 읽습니다.");
+    loadLibrary(true);
+  } else if (act === "rescan") {
+    loadLibrary(true); toast("곡 목록을 다시 읽습니다.");
+  } else if (act === "eq") {
+    openEqSheet(); return;
+  } else if (act === "clear-covers") {
+    try { await caches.delete(COVER_CACHE); } catch (_) {}
+    LS.set(COVER_KEYS, []); toast("커버 캐시를 비웠습니다.");
+  } else if (act === "update") {
+    try { const reg = await navigator.serviceWorker?.getRegistration(); await reg?.update(); } catch (_) {}
+    toast("확인했습니다 — 새 버전이 있으면 자동으로 다시 열립니다.");
+  } else if (act === "client") {
+    const v = prompt("Google OAuth Client ID", CLIENT_ID);
+    if (v && v.trim() && v.trim() !== CLIENT_ID) { LS.set("client_id", v.trim()); location.reload(); }
+    return;
+  }
+  renderSettings();
+}
+function bindSettings() {
+  const box = $("#settings-body"); if (!box) return;
+  box.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-act]"); if (b) onSettingsAction(b.dataset.act);
+  });
+  box.addEventListener("change", (e) => {
+    const o = e.target.dataset?.opt;
+    if (o === "crossfade") { crossfadeOn = e.target.checked; LS.set("crossfade", crossfadeOn); }
+    if (o === "norm") applyNormalize(e.target.checked);
+  });
 }
 /* ── 커버(커스텀=로컬 저장, 없으면 첫 곡 앨범커버) ── */
 function plCustomCovers() { return LS.get("pl_covers", {}); }
@@ -1961,6 +2144,7 @@ function switchTab(tab) {
   $$(".tabview").forEach((v) => (v.hidden = v.dataset.view !== tab));
   if (tab === "playlists") renderPlaylists();
   if (tab === "stats") renderStats();
+  if (tab === "settings") renderSettings();
 }
 
 /* ───────────────────── 태그 캐시 / 읽기 ───────────────────── */
@@ -2132,15 +2316,7 @@ async function loadLibrary(forceRefresh) {
     $("#track-list").innerHTML = `<li class="entries-empty">목록 로딩 실패: ${escapeHtml(e.message)}</li>`;
   }
 }
-// 음악 폴더 경로 편집(로그인 후 📁 버튼) → 다시 스캔.
-function editFolders() {
-  const ans = prompt("음악 폴더 경로 (My Drive 기준, 한 줄에 하나):", getFolderPaths().join("\n"));
-  if (ans == null) return;
-  const arr = ans.split("\n").map((s) => s.trim()).filter(Boolean);
-  if (!arr.length) return;
-  setFolderPaths(arr);
-  loadLibrary(true);
-}
+// (음악 폴더 편집은 설정 탭의 '음악 폴더' 카드로 옮겼다 — onSettingsAction("folders"))
 
 /* ───────────────────── 인증 흐름 ───────────────────── */
 async function signIn() {
@@ -2201,9 +2377,8 @@ function bind() {
     if (isIOS()) alert("Safari 하단의 공유 버튼(□↑)을 누른 뒤 '홈 화면에 추가'를 선택하세요.");
     else alert("브라우저 메뉴(⋮)에서 '앱 설치' 또는 '홈 화면에 추가'를 누르세요.");
   });
-  $("#btn-folders").addEventListener("click", editFolders);
   $("#btn-refresh").addEventListener("click", () => loadLibrary(true));
-  $("#btn-signout").addEventListener("click", signOut);
+  bindSettings();   // 폴더·로그아웃은 설정 탭으로 옮겼다
   $("#search").addEventListener("input", applySearch);
 
   // 정렬 / 보기 전환 / 곡 정보 읽기
@@ -2477,7 +2652,7 @@ function bindAudioEvents(el) {
     if (++posTick % 8 === 0) { updatePositionState(); saveResume(false); }   // 약 2초마다 진행바·이어듣기 갱신
     // 곡 끝 CROSSFADE_MS 전에 다음 곡으로 미리 넘어가 겹치게 한다(AIMP식).
     // 볼륨 조절이 되는 기기에서만(iOS는 즉시 전환). repeat one은 제외.
-    if (crossfadeOK && !advancing && repeat !== "one" && d && c > 1
+    if (crossfadeOK && crossfadeOn && !advancing && repeat !== "one" && d && c > 1
         && (d - c) <= CROSSFADE_MS / 1000) {
       advancing = true;
       nextTrack(true);
@@ -2508,8 +2683,13 @@ async function main() {
   document.addEventListener("keydown", renewOnGesture, true);
   // 앱을 다시 볼 때 이미 만료됐으면 띠로 알린다(갱신은 다음 터치에서).
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && LS.get("signed_in", false) && !tokenFresh()) showReconnect();
+    if (document.visibilityState !== "visible") return;
+    if (LS.get("signed_in", false) && !tokenFresh()) showReconnect();
+    else autoSync();
   });
+  window.addEventListener("online", autoSync);
+  window.addEventListener("online", () => { if (activeTab === "settings") renderSettings(); });
+  window.addEventListener("offline", () => { if (activeTab === "settings") renderSettings(); });
   // 이전에 로그인한 적이 있으면 로그인 화면 없이 진입.
   if (CLIENT_ID && LS.get("signed_in", false)) {
     // 1) 저장된 토큰이 아직 유효 → 즉시 진입(네트워크·구글 세션 불필요).

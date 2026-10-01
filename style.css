@@ -328,3 +328,23 @@ img{display:block}
 
 /* 가사 줄: 탭 가능 표시 */
 .ly-line{cursor:pointer}
+
+/* ───── 설정 탭 (학습 앱 설정 화면을 본뜸: 상태 행 + 톤) ───── */
+.set-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;margin-bottom:14px}
+.set-card h3{font-size:14px;margin:0 0 8px;color:var(--ink)}
+.set-row{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--line);font-size:13px}
+.set-row:last-of-type{border-bottom:0}
+.set-row .k{color:var(--muted);flex:none}
+.set-row .v{text-align:right;color:var(--ink);word-break:break-all}
+.set-row .v.good{color:#2f7d4f;font-weight:700}
+.set-row .v.warn{color:#b9561f;font-weight:700}
+.set-row .v.off{color:var(--faint)}
+.set-actions{display:flex;flex-wrap:wrap;gap:8px;padding-top:10px}
+.set-note{font-size:12px;color:var(--faint);line-height:1.5;margin:8px 0 0}
+.set-text{width:100%;box-sizing:border-box;margin-top:8px;padding:9px 10px;border:1px solid var(--line);border-radius:var(--radius-sm);
+  background:var(--bg);color:var(--ink);font-size:13px;font-family:inherit;resize:vertical}
+.set-toggle{display:flex;justify-content:space-between;align-items:center;padding:9px 0;font-size:13.5px;border-bottom:1px solid var(--line)}
+.set-toggle input{width:20px;height:20px;accent-color:var(--accent)}
+.set-log{margin-top:10px;font-size:12px;color:var(--muted);line-height:1.7;max-height:150px;overflow:auto}
+.set-log .bad{color:#b9561f}
+#set-probe:not(:empty){margin-top:10px;padding:6px 10px;border-radius:var(--radius-sm);background:var(--bg)}
