@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v34";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v35";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -157,6 +157,7 @@ function requestToken(interactive) {
       sendTokenToSW();   // SW가 <audio> 스트리밍 요청에 인증을 주입할 수 있도록 전달
       hideReconnect();
       if (!LS.get("account_email", "")) rememberEmail(accessToken);
+      syncBrokerFromDrive(accessToken);   // 내 Drive 의 templum_broker.json → 중계 자동 설정·키 교체 반영
       if (writePending) { writePending = false; setTimeout(() => refreshPlaylists(true), 300); }   // 밀린 쓰기 마저
       w?.resolve(accessToken);
     };
@@ -184,6 +185,7 @@ const tokenFresh = () => accessToken && Date.now() < tokenExp;
    · 쓰기(재생목록 저장)는 여전히 앱 로그인(drive.file) — 필요할 때만 터치로 갱신(writePending). */
 let brokerTok = "", brokerExp = 0, brokerTimer = null, brokerBusy = null;
 let writePending = false;   // 쓰기 토큰이 만료돼 미뤄 둔 쓰기가 있다 → 다음 터치에서 로그인 갱신
+let brokerBad = false;      // 중계가 키를 거절(키 교체됨) → 다음 터치에서 로그인 갱신 → Drive 설정 파일에서 새 키
 const brokerCfg = () => { const b = LS.get("broker", null); return (b && b.url && b.key) ? b : null; };
 const brokerFresh = () => !!brokerTok && Date.now() < brokerExp;
 (function restoreBroker() {
@@ -201,6 +203,7 @@ function refreshBroker() {
       if (!d.token) throw new Error(d.error === "forbidden" ? "키가 맞지 않습니다" : (d.error || "중계 응답 " + r.status));
       brokerTok = d.token;
       brokerExp = Date.now() + (Number(d.expires_in) || 3000) * 1000 - 60e3;
+      brokerBad = false;
       LS.set("broker_tok", { t: brokerTok, exp: brokerExp });
       LS.set("broker_err", "");
       sendTokenToSW();
@@ -209,6 +212,7 @@ function refreshBroker() {
       return brokerTok;
     } catch (e) {
       LS.set("broker_err", String(e.message || e));
+      if (/키가 맞지 않/.test(e.message || "")) brokerBad = true;
       scheduleBroker(60e3);   // 실패하면 1분 뒤 다시
       throw e;
     } finally { brokerBusy = null; }
@@ -221,13 +225,37 @@ function scheduleBroker(ms) {
   const wait = ms ?? Math.max(30e3, brokerExp - Date.now() - RENEW_AHEAD_MS);
   brokerTimer = setTimeout(() => refreshBroker().catch(() => {}), wait);
 }
+// 내 Drive 최상위의 templum_broker.json({url,key}) — Apps Script setup() 이 쓴다.
+// 앱 로그인 토큰(drive.readonly)으로 읽어 중계를 스스로 설정한다. 폰에서 입력할 것이 없고,
+// 키를 바꾸면 다음 로그인 때 따라온다. 본인 계정으로만 읽히므로 공개 저장소와 무관하다.
+const BROKER_FILE = "templum_broker.json";
+async function syncBrokerFromDrive(tok) {
+  try {
+    const q = encodeURIComponent(`name='${BROKER_FILE}' and trashed=false`);
+    const r = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&orderBy=modifiedTime desc&pageSize=1&fields=files(id)`,
+      { headers: { Authorization: "Bearer " + tok }, cache: "no-store" });
+    const f = r.ok ? ((await r.json()).files || [])[0] : null;
+    if (!f) return;
+    const r2 = await fetch(`https://www.googleapis.com/drive/v3/files/${f.id}?alt=media`,
+      { headers: { Authorization: "Bearer " + tok }, cache: "no-store" });
+    const c = r2.ok ? await r2.json().catch(() => null) : null;
+    if (!c || !/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec$/.test(c.url || "") || !c.key) return;
+    const cur = brokerCfg();
+    if (cur && cur.url === c.url && cur.key === c.key && !brokerBad) return;
+    LS.set("broker", { url: c.url, key: c.key });
+    brokerTok = ""; brokerExp = 0; brokerBad = false;
+    await refreshBroker();
+    toast(cur ? "토큰 중계 키를 새로 받았습니다." : "토큰 중계를 자동으로 설정했습니다 — 1시간 제한 없이 재생됩니다.");
+    if (activeTab === "settings") renderSettings();
+  } catch (_) { /* 파일이 없거나 오프라인 — 다음 로그인 때 다시 */ }
+}
 // 지금 읽기에 쓸 토큰(중계 우선) — 없으면 "".
 const readToken = () => brokerFresh() ? brokerTok : (tokenFresh() ? accessToken : "");
 
 // 앱 로그인 갱신이 필요한가: 중계가 있으면 '미뤄 둔 쓰기'가 있을 때만(1시간마다 팝업을 띄우지 않게).
 const needsRenew = () => LS.get("signed_in", false)
   && (!accessToken || tokenExp - Date.now() < RENEW_AHEAD_MS)
-  && (!brokerCfg() || writePending);
+  && (!brokerCfg() || writePending || brokerBad);
 // 터치 순간에만 부른다(팝업 허용). 이미 진행 중이면 그 결과를 함께 기다린다.
 function renewOnGesture() {
   if (!tokenClient || renewing || !needsRenew() || !navigator.onLine) return;
@@ -2826,6 +2854,7 @@ async function main() {
     if (tokenFresh() || brokerFresh()) {
       sendTokenToSW();
       enterApp();
+      if (tokenFresh()) syncBrokerFromDrive(accessToken);
       initToken().catch(() => {});   // 나중 토큰 갱신에 대비해 백그라운드 준비
       scheduleBroker();              // 중계 토큰은 만료 10분 전에 미리 갱신
       return;
