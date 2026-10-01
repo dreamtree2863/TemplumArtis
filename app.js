@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v33";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v34";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -157,6 +157,7 @@ function requestToken(interactive) {
       sendTokenToSW();   // SW가 <audio> 스트리밍 요청에 인증을 주입할 수 있도록 전달
       hideReconnect();
       if (!LS.get("account_email", "")) rememberEmail(accessToken);
+      if (writePending) { writePending = false; setTimeout(() => refreshPlaylists(true), 300); }   // 밀린 쓰기 마저
       w?.resolve(accessToken);
     };
     const opts = { prompt: interactive ? "consent" : "" };
@@ -175,22 +176,84 @@ async function rememberEmail(tok) {
   } catch (_) {}
 }
 const tokenFresh = () => accessToken && Date.now() < tokenExp;
-const needsRenew = () => LS.get("signed_in", false) && (!accessToken || tokenExp - Date.now() < RENEW_AHEAD_MS);
+
+/* ── 토큰 중계(Google Apps Script, 2026-10-01) — 1시간 제한 해제 ──
+   소유자 계정으로 도는 웹 앱이 **읽기 전용** 토큰을 팝업 없이 준다(설정 › 토큰 중계에서 주소·키 입력).
+   · 읽기(목록·스트리밍·커버)는 이 토큰을 쓰고, 만료 10분 전에 미리 다시 받는다(호출이 ~5초 걸린다).
+   · 백그라운드 재생 중 만료되면 서비스워커가 401 을 받고 직접 중계를 불러 이어 간다.
+   · 쓰기(재생목록 저장)는 여전히 앱 로그인(drive.file) — 필요할 때만 터치로 갱신(writePending). */
+let brokerTok = "", brokerExp = 0, brokerTimer = null, brokerBusy = null;
+let writePending = false;   // 쓰기 토큰이 만료돼 미뤄 둔 쓰기가 있다 → 다음 터치에서 로그인 갱신
+const brokerCfg = () => { const b = LS.get("broker", null); return (b && b.url && b.key) ? b : null; };
+const brokerFresh = () => !!brokerTok && Date.now() < brokerExp;
+(function restoreBroker() {
+  const b = LS.get("broker_tok", null);
+  if (b && b.t && b.exp > Date.now() + 60e3) { brokerTok = b.t; brokerExp = b.exp; }
+})();
+function refreshBroker() {
+  const cfg = brokerCfg();
+  if (!cfg) return Promise.reject(new Error("토큰 중계 미설정"));
+  if (brokerBusy) return brokerBusy;
+  brokerBusy = (async () => {
+    try {
+      const r = await fetch(`${cfg.url}?key=${encodeURIComponent(cfg.key)}&app=music`, { cache: "no-store" });
+      const d = await r.json().catch(() => ({}));
+      if (!d.token) throw new Error(d.error === "forbidden" ? "키가 맞지 않습니다" : (d.error || "중계 응답 " + r.status));
+      brokerTok = d.token;
+      brokerExp = Date.now() + (Number(d.expires_in) || 3000) * 1000 - 60e3;
+      LS.set("broker_tok", { t: brokerTok, exp: brokerExp });
+      LS.set("broker_err", "");
+      sendTokenToSW();
+      if (!writePending) hideReconnect();
+      scheduleBroker();
+      return brokerTok;
+    } catch (e) {
+      LS.set("broker_err", String(e.message || e));
+      scheduleBroker(60e3);   // 실패하면 1분 뒤 다시
+      throw e;
+    } finally { brokerBusy = null; }
+  })();
+  return brokerBusy;
+}
+function scheduleBroker(ms) {
+  clearTimeout(brokerTimer);
+  if (!brokerCfg()) return;
+  const wait = ms ?? Math.max(30e3, brokerExp - Date.now() - RENEW_AHEAD_MS);
+  brokerTimer = setTimeout(() => refreshBroker().catch(() => {}), wait);
+}
+// 지금 읽기에 쓸 토큰(중계 우선) — 없으면 "".
+const readToken = () => brokerFresh() ? brokerTok : (tokenFresh() ? accessToken : "");
+
+// 앱 로그인 갱신이 필요한가: 중계가 있으면 '미뤄 둔 쓰기'가 있을 때만(1시간마다 팝업을 띄우지 않게).
+const needsRenew = () => LS.get("signed_in", false)
+  && (!accessToken || tokenExp - Date.now() < RENEW_AHEAD_MS)
+  && (!brokerCfg() || writePending);
 // 터치 순간에만 부른다(팝업 허용). 이미 진행 중이면 그 결과를 함께 기다린다.
 function renewOnGesture() {
   if (!tokenClient || renewing || !needsRenew() || !navigator.onLine) return;
   renewing = true;
   requestToken(false).catch(() => { renewing = false; if (!tokenFresh()) showReconnect(); });
 }
+// 읽기용 토큰. 중계가 있으면 팝업 없이 받아 온다.
 async function ensureToken() {
-  if (tokenFresh()) return accessToken;
+  const t = readToken();
+  if (t) return t;
+  if (brokerCfg()) { try { return await refreshBroker(); } catch (_) { /* 아래로 */ } }
   // 터치 밖에서는 팝업이 막힌다 → 기다리지 말고 '다시 연결'을 띄우고 실패시킨다.
   showReconnect();
   throw new Error("연결이 만료됐습니다 — 화면을 한 번 누르면 다시 연결됩니다");
 }
+// 쓰기용 토큰(앱 로그인, drive.file). 만료면 쓰기를 미뤄 두고 다음 터치에서 갱신.
+async function ensureWriteToken() {
+  if (tokenFresh()) return accessToken;
+  writePending = true;
+  showReconnect();
+  throw new Error("쓰기 연결 만료 — 화면을 한 번 누르면 이어서 저장합니다");
+}
 // 화면 위 '다시 연결' 띠 — 누르는 것 자체가 터치라 그 순간 renewOnGesture 가 갱신한다.
 function showReconnect() {
   if (!LS.get("signed_in", false) || document.getElementById("reconnect-bar")) return;
+  if (brokerFresh() && !writePending) return;   // 읽기는 중계로 되고 있다 — 띄울 이유가 없다
   const bar = document.createElement("div");
   bar.id = "reconnect-bar";
   bar.textContent = "🔄 연결이 만료됐습니다 — 눌러서 다시 연결";
@@ -203,12 +266,17 @@ function hideReconnect() { document.getElementById("reconnect-bar")?.remove(); }
 // 액세스 토큰을 서비스워커에 전달(메모리 보관). <audio src>가 Drive URL을 직접
 // 요청할 때 SW가 Authorization 헤더를 넣어준다.
 function sendTokenToSW() {
-  if (!("serviceWorker" in navigator) || !accessToken) return;
-  // 1) 캐시에 저장 → 백그라운드에서 SW가 종료·재시작돼도 인증 토큰을 읽을 수 있음.
-  if (window.caches) caches.open("ta-auth").then((c) => c.put("token", new Response(accessToken))).catch(() => {});
+  const tok = readToken();   // 스트리밍은 읽기 — 중계 토큰 우선
+  if (!("serviceWorker" in navigator) || !tok) return;
+  const cfg = brokerCfg();
+  // 1) 캐시에 저장 → 백그라운드에서 SW가 종료·재시작돼도 인증 토큰(과 중계 설정)을 읽을 수 있음.
+  if (window.caches) caches.open("ta-auth").then((c) => {
+    c.put("token", new Response(tok));
+    return cfg ? c.put("broker", new Response(JSON.stringify(cfg))) : c.delete("broker");
+  }).catch(() => {});
   // 2) 실행 중인 SW에 즉시 전달.
   navigator.serviceWorker.ready.then((reg) => {
-    (navigator.serviceWorker.controller || reg.active)?.postMessage({ type: "token", token: accessToken });
+    (navigator.serviceWorker.controller || reg.active)?.postMessage({ type: "token", token: tok, broker: cfg });
   }).catch(() => {});
 }
 // 태그(메타/커버/USLT)만 파싱하려고 파일 앞부분(ID3v2 영역)만 Range로 받는다.
@@ -402,7 +470,10 @@ async function prefetchCoversAhead(fromIndex, n) {
 async function driveFetch(url, asBlob) {
   const token = await ensureToken();
   const r = await fetch(url, { headers: { Authorization: "Bearer " + token } });
-  if (r.status === 401) { accessToken = ""; const t2 = await ensureToken();
+  if (r.status === 401) {
+    // 만료된 쪽만 버린다 — 중계 토큰이었으면 중계를, 앱 로그인 토큰이었으면 그것을
+    if (token === brokerTok) { brokerTok = ""; brokerExp = 0; } else { accessToken = ""; }
+    const t2 = await ensureToken();
     const r2 = await fetch(url, { headers: { Authorization: "Bearer " + t2 } });
     if (!r2.ok) throw new Error("Drive " + r2.status); return asBlob ? r2.arrayBuffer() : r2.json();
   }
@@ -1455,11 +1526,20 @@ async function readSharedItems() {
   const doc = await r.json().catch(() => null);
   return (doc && Array.isArray(doc.items)) ? doc.items : [];
 }
+// 두 목록이 내용상 같은가(순서 무관) — 같으면 쓰지 않는다(쓰기는 앱 로그인이 필요해 아낀다).
+function sameItems(a, b) {
+  const norm = (xs) => JSON.stringify((xs || []).map((i) => i.deleted
+    ? { id: i.id, d: 1, ts: i.ts || 0 } : { id: i.id, n: i.name, r: i.rel, ts: i.ts || 0 })
+    .sort((x, y) => (x.id < y.id ? -1 : 1)));
+  return norm(a) === norm(b);
+}
 // 공용 파일 저장(있으면 PATCH, 없으면 음악 폴더에 생성). 권한 없으면 한 번 동의받고 재시도.
-async function writeSharedItems(items) {
+// remote 를 주면(방금 읽은 공용 내용) 같을 때 쓰기를 건너뛰고 false 를 돌려준다.
+async function writeSharedItems(items, remote) {
+  if (remote && plFileId && sameItems(items, remote)) return false;
   const body = JSON.stringify({ v: 1, items });
   async function write() {
-    const token = await ensureToken();
+    const token = await ensureWriteToken();
     const id = await findPlaylistFile();
     if (id) {
       const r = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${id}?uploadType=media`, {
@@ -1487,6 +1567,7 @@ async function writeSharedItems(items) {
       await requestToken(true); await write();
     } else throw e;
   }
+  return true;
 }
 
 // 라이브러리 로드 후 호출: 로컬+공용 병합 → 반영 → 공용 저장. 구(파일ID) 플레이리스트도 이관.
@@ -1517,10 +1598,11 @@ async function syncPlaylists() {
   }
   // 공용 파일과 병합
   try {
-    const merged = mergeItems(plItems(), await readSharedItems(), Date.now());
+    const remote = await readSharedItems();
+    const merged = mergeItems(plItems(), remote, Date.now());
     plFromItems(merged);
     LS.set("pl_items", plItems());
-    await writeSharedItems(plItems());   // 폰이 파일을 만들거나 갱신(양쪽 수렴)
+    await writeSharedItems(plItems(), remote);   // 폰이 파일을 만들거나 갱신(양쪽 수렴)
     plSynced = true;
     noteSync(true, `시작 동기화 · 목록 ${playlists.length}개`);
   } catch (e) { noteSync(false, "", navigator.onLine ? e : "오프라인 — 폰에 저장된 목록만 사용"); }
@@ -1551,10 +1633,11 @@ async function refreshPlaylists(silent) {
   document.querySelectorAll("#btn-pl-refresh, #pl-refresh-btn").forEach((b) => b.classList.add("spinning"));
   try {
     const before = JSON.stringify(plItems());
-    const merged = mergeItems(plItems(), await readSharedItems(), Date.now());
+    const remote = await readSharedItems();
+    const merged = mergeItems(plItems(), remote, Date.now());
     plFromItems(merged);
     LS.set("pl_items", plItems());
-    await writeSharedItems(plItems());   // 양쪽 수렴(폰 로컬 변경도 함께 반영)
+    await writeSharedItems(plItems(), remote);   // 양쪽 수렴(폰 로컬 변경도 함께 반영)
     if (activeTab === "playlists") renderPlaylists();
     const same = JSON.stringify(plItems()) === before;
     noteSync(true, same ? "변경 없음" : "PC 변경 반영");
@@ -1574,9 +1657,10 @@ function savePlaylists() {
   clearTimeout(plSaveTimer);
   plSaveTimer = setTimeout(async () => {
     try {
-      const merged = mergeItems(plItems(), await readSharedItems(), Date.now());
+      const remote = await readSharedItems();
+      const merged = mergeItems(plItems(), remote, Date.now());
       plFromItems(merged); LS.set("pl_items", plItems());
-      await writeSharedItems(plItems());
+      await writeSharedItems(plItems(), remote);
       if (activeTab === "playlists") renderPlaylists();
       noteSync(true, "폰 변경 저장");
     } catch (e) { noteSync(false, "", e); }
@@ -1602,7 +1686,7 @@ function noteSync(ok, what, err) {
 }
 // 앱을 다시 볼 때·연결이 돌아올 때 조용히 동기화(학습 앱 wireUplink 와 같은 취지). 5분 간격 이내.
 function autoSync() {
-  if (!plSynced || !navigator.onLine || !tokenFresh()) return;
+  if (!plSynced || !navigator.onLine || !readToken()) return;
   if (Date.now() - (LS.get(SYNC_KEY, {}).lastOk || 0) < AUTO_SYNC_GAP) return;
   refreshPlaylists(true);
 }
@@ -1635,6 +1719,7 @@ async function renderSettings() {
   const tombs = Object.keys(plTombs).length;
   const log = LS.get(SYNC_LOG, []).slice(0, 8);
   const okAge = s.lastOk ? Date.now() - s.lastOk : Infinity;
+  const bcfg = brokerCfg();
   const keepFolders = document.activeElement?.id === "set-folders";   // 입력 중이면 덮어쓰지 않는다
   const folderText = keepFolders ? $("#set-folders").value : getFolderPaths().join("\n");
   box.innerHTML =
@@ -1645,6 +1730,16 @@ async function renderSettings() {
         : signed ? "만료 — 화면을 누르면 갱신" : "로그인 안 됨",
         tokenFresh() ? "good" : signed ? "warn" : "off"],
     ]) + `<div class="set-actions">${setBtn("renew", "다시 연결")}${setBtn("signout", "로그아웃")}</div>`)
+    + setCard("토큰 중계 (1시간 제한 해제)", setRows([
+      ["상태", !bcfg ? "설정 안 됨 — 1시간마다 터치로 갱신" : brokerFresh()
+        ? `연결됨 · ${Math.max(1, Math.round((brokerExp - Date.now()) / 60e3))}분 남음(자동 갱신)` : "토큰 받는 중 / 실패",
+        !bcfg ? "off" : brokerFresh() ? "good" : "warn"],
+      ["마지막 오류", LS.get("broker_err", "") || "없음", LS.get("broker_err", "") ? "warn" : ""],
+      ["쓰기 대기", writePending ? "있음 — 화면을 누르면 저장" : "없음", writePending ? "warn" : ""],
+    ]) + `<input id="set-broker-url" class="set-text" placeholder="웹 앱 URL (…/exec)" value="${escapeHtml(bcfg?.url || "")}" autocomplete="off">`
+      + `<input id="set-broker-key" class="set-text" type="password" placeholder="비밀 키" value="${escapeHtml(bcfg?.key || "")}" autocomplete="off">`
+      + `<p class="set-note">Apps Script 중계가 <b>읽기 전용</b> 토큰을 팝업 없이 받아 와, 화면을 꺼 두고 들어도 끊기지 않습니다. 재생목록 저장(쓰기)만 앱 로그인을 씁니다.</p>`
+      + `<div class="set-actions">${setBtn("broker-save", "저장하고 시험")}${bcfg ? setBtn("broker-clear", "해제") : ""}</div>`)
     + setCard("PC 동기화 (재생목록)", setRows([
       ["마지막 성공", s.lastOk ? `${when(s.lastOk)} · ${s.lastResult || ""}` : "없음",
         okAge < 86400e3 ? "good" : s.lastOk ? "warn" : "off"],
@@ -1718,6 +1813,20 @@ async function onSettingsAction(act) {
   } else if (act === "signout") {
     if (confirm("로그아웃할까요? 폰에 저장된 목록은 그대로 남습니다.")) signOut();
     return;
+  } else if (act === "broker-save") {
+    const url = ($("#set-broker-url").value || "").trim(), key = ($("#set-broker-key").value || "").trim();
+    if (!/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec$/.test(url)) return toast("웹 앱 URL 형식이 아닙니다(…/exec 로 끝나야 함).");
+    if (!key) return toast("비밀 키를 입력하세요.");
+    LS.set("broker", { url, key }); brokerTok = ""; brokerExp = 0;
+    toast("중계를 시험하는 중…(5초쯤)");
+    try { await refreshBroker(); toast("토큰 중계 연결됨 — 이제 1시간 제한 없이 재생됩니다."); }
+    catch (e) { toast("중계 실패: " + e.message); }
+  } else if (act === "broker-clear") {
+    if (!confirm("토큰 중계를 해제할까요? 다시 1시간마다 터치로 갱신합니다.")) return;
+    LS.set("broker", null); LS.set("broker_tok", null); brokerTok = ""; brokerExp = 0;
+    clearTimeout(brokerTimer); sendTokenToSW();
+    try { (await caches.open("ta-auth")).delete("broker"); } catch (_) {}
+    toast("해제했습니다.");
   } else if (act === "sync") {
     await refreshPlaylists(false);
   } else if (act === "probe") {
@@ -2662,8 +2771,27 @@ function bindAudioEvents(el) {
 }
 
 /* ───────────────────── 시작 ───────────────────── */
+// 설정 링크(#broker=<base64url JSON {url,key}>) — 폰에서 한 번 누르면 토큰 중계가 설정된다.
+// 주소·키는 이 기기(localStorage)에만 저장하고 주소창에서 즉시 지운다 — 코드·저장소에는 없다
+// (공개 저장소라 키를 코드에 넣으면 누구나 Drive 를 읽을 수 있게 된다).
+function takeBrokerLink() {
+  const m = location.hash.match(/^#broker=([A-Za-z0-9_-]+)$/);
+  if (!m) return "";
+  history.replaceState(null, "", location.pathname + location.search);
+  try {
+    const cfg = JSON.parse(atob(m[1].replace(/-/g, "+").replace(/_/g, "/")));
+    if (!/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec$/.test(cfg.url || "") || !cfg.key) throw new Error("bad");
+    LS.set("broker", { url: cfg.url, key: cfg.key });
+    LS.set("broker_tok", null); brokerTok = ""; brokerExp = 0;
+    return "ok";
+  } catch (_) { return "bad"; }
+}
+
 async function main() {
+  const linked = takeBrokerLink();
   bind();
+  if (linked === "ok") toast("토큰 중계를 설정했습니다 — 1시간 제한 없이 재생됩니다.");
+  if (linked === "bad") toast("설정 링크가 올바르지 않습니다.");
   // iOS Safari는 beforeinstallprompt가 없다. 설치 전(브라우저 실행)이면 버튼을 띄워
   // 수동 안내로라도 설치를 돕는다. 이미 설치돼 실행 중이면 숨긴다.
   if (!isStandalone() && isIOS()) showInstallFab();
@@ -2684,7 +2812,9 @@ async function main() {
   // 앱을 다시 볼 때 이미 만료됐으면 띠로 알린다(갱신은 다음 터치에서).
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;
-    if (LS.get("signed_in", false) && !tokenFresh()) showReconnect();
+    // 중계가 있으면 곧 만료될 읽기 토큰을 미리 받는다(백그라운드에선 타이머가 늦게 돌 수 있다)
+    if (brokerCfg() && brokerExp - Date.now() < RENEW_AHEAD_MS) refreshBroker().then(autoSync).catch(() => {});
+    else if (LS.get("signed_in", false) && !readToken()) showReconnect();
     else autoSync();
   });
   window.addEventListener("online", autoSync);
@@ -2693,10 +2823,18 @@ async function main() {
   // 이전에 로그인한 적이 있으면 로그인 화면 없이 진입.
   if (CLIENT_ID && LS.get("signed_in", false)) {
     // 1) 저장된 토큰이 아직 유효 → 즉시 진입(네트워크·구글 세션 불필요).
-    if (tokenFresh()) {
+    if (tokenFresh() || brokerFresh()) {
       sendTokenToSW();
       enterApp();
       initToken().catch(() => {});   // 나중 토큰 갱신에 대비해 백그라운드 준비
+      scheduleBroker();              // 중계 토큰은 만료 10분 전에 미리 갱신
+      return;
+    }
+    // 1-b) 중계가 있으면 팝업 없이 읽기 토큰을 받아 바로 들어간다(약 5초).
+    if (brokerCfg()) {
+      initToken().catch(() => {});
+      enterApp();
+      refreshBroker().catch(() => showReconnect());
       return;
     }
     // 2) 만료됐어도 들여보낸다 — 캐시된 곡 목록은 그대로 보이고, 첫 터치에서 조용히 재발급.

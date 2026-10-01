@@ -3,7 +3,7 @@
    · Drive 오디오(alt=media): <audio>가 직접 스트리밍. SW가 Authorization 헤더를
      주입하고 Range 요청을 그대로 전달(206) → 통째 다운로드 없이 즉시 재생/탐색.
    (스트리밍 인증 주입 기법은 Templum Sapientiae Mobile PWA에서 검증된 방식.) */
-const CACHE = "ta-music-v33";
+const CACHE = "ta-music-v34";
 const AUTH_CACHE = "ta-auth";   // Drive 토큰 보관(SW 재시작 후에도 읽기 위함)
 const COVER_CACHE = "ta-covers";   // 추출한 앨범 커버(재생 시 즉시 표시). 갱신 때 지우지 않는다.
 const SHELL = [
@@ -29,9 +29,46 @@ self.addEventListener("message", (e) => {
   if (d === "skipWaiting") return self.skipWaiting();
   if (d && d.type === "token" && d.token) {
     swToken = d.token;
+    swBroker = d.broker || null;
     caches.open(AUTH_CACHE).then((c) => c.put("token", new Response(d.token))).catch(() => {});
   }
 });
+
+/* 토큰 중계(Apps Script) — 화면이 꺼져 페이지 타이머가 멈춘 채 토큰이 만료돼도,
+   SW 가 401 을 받으면 직접 중계에서 새 읽기 토큰을 받아 같은 요청을 다시 보낸다.
+   (그래야 백그라운드 재생이 1시간에서 끊기지 않는다) */
+let swBroker = null, brokerInflight = null;
+async function brokerConfig() {
+  if (swBroker) return swBroker;
+  try {
+    const r = await (await caches.open(AUTH_CACHE)).match("broker");
+    if (r) swBroker = JSON.parse(await r.text());
+  } catch (_) {}
+  return swBroker;
+}
+function brokerToken() {
+  if (brokerInflight) return brokerInflight;
+  brokerInflight = (async () => {
+    const cfg = await brokerConfig();
+    if (!cfg || !cfg.url || !cfg.key) return "";
+    const r = await fetch(`${cfg.url}?key=${encodeURIComponent(cfg.key)}&app=music-sw`, { cache: "no-store" });
+    const d = await r.json().catch(() => ({}));
+    if (!d.token) return "";
+    swToken = d.token;
+    caches.open(AUTH_CACHE).then((c) => c.put("token", new Response(d.token))).catch(() => {});
+    return d.token;
+  })().catch(() => "").finally(() => { brokerInflight = null; });
+  return brokerInflight;
+}
+async function streamWithAuth(req) {
+  const injected = !req.headers.has("Authorization");   // <audio> 직접 요청만 우리가 인증을 채운다
+  let res = await fetch(authReq(req, await getToken()), { cache: "no-store" });
+  if (res.status === 401 && injected) {
+    const fresh = await brokerToken();
+    if (fresh) res = await fetch(authReq(req, fresh), { cache: "no-store" });
+  }
+  return res;
+}
 
 // 메모리 토큰이 없으면(백그라운드에서 SW가 종료됐다 재시작된 경우) 캐시에서 복원.
 async function getToken() {
@@ -62,8 +99,7 @@ self.addEventListener("fetch", (e) => {
       && url.searchParams.get("alt") === "media") {
     if (req.destination === "audio" || req.destination === "video" || req.headers.has("range")) {
       e.respondWith(
-        getToken().then((tok) => fetch(authReq(req, tok), { cache: "no-store" }))
-          .catch(() => new Response("", { status: 504 }))
+        streamWithAuth(req).catch(() => new Response("", { status: 504 }))
       );
     }
     return; // 그 외 alt=media(메타 range fetch 등)는 페이지가 직접 인증해 가져감
