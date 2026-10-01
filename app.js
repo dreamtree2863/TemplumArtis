@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v31";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v32";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -120,33 +120,86 @@ function waitForGIS() {
     tick();
   });
 }
+/* ‼ 토큰은 1시간이면 만료되고 리프레시 토큰은 없다. '조용한' 재발급(prompt:"")도 팝업을 여는데,
+     설치형 PWA(안드로이드)는 **터치 없이 연 팝업을 막는다** — 콜백도 안 와서 재진입 때 로그인 화면에
+     멈추고, 재생 도중 만료되면 다음 곡에서 끊겼다(2026-10-01). 그래서:
+     · 재발급은 **터치 순간에** 한다(만료 10분 전부터 다음 터치에서 미리).
+     · 만료 ≠ 로그아웃 — 앱에 그대로 들여보내고 '다시 연결' 띠만 띄운다.
+     · login_hint 로 계정 선택 창 없이, error_callback 으로 막힌 팝업을 기다리지 않게. */
+const RENEW_AHEAD_MS = 10 * 60 * 1000;
+let tokenWaiters = null;   // 진행 중인 요청의 {resolve, reject} — 콜백·error_callback 이 푼다
+let renewing = false;
 async function initToken() {
   await waitForGIS();
   tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: CLIENT_ID,
     scope: DRIVE_SCOPE,
     callback: () => {},   // 매 요청마다 갈아끼움
+    error_callback: (err) => {   // 팝업 차단·닫힘 — 이게 없으면 Promise 가 영원히 안 끝난다
+      renewing = false;
+      const w = tokenWaiters; tokenWaiters = null;
+      w?.reject(new Error(err?.type || "popup_failed"));
+    },
   });
 }
 function requestToken(interactive) {
   return new Promise((resolve, reject) => {
     if (!tokenClient) return reject(new Error("토큰 클라이언트 미초기화"));
+    tokenWaiters = { resolve, reject };
     tokenClient.callback = (resp) => {
-      if (resp.error) return reject(new Error(resp.error));
+      renewing = false;
+      const w = tokenWaiters; tokenWaiters = null;
+      if (resp.error) return w?.reject(new Error(resp.error));
       accessToken = resp.access_token;
       tokenExp = Date.now() + (resp.expires_in - 60) * 1000;
       LS.set("signed_in", true);
       LS.set("token", { t: accessToken, exp: tokenExp });   // 재진입 시 재사용(만료 전까지)
       sendTokenToSW();   // SW가 <audio> 스트리밍 요청에 인증을 주입할 수 있도록 전달
-      resolve(accessToken);
+      hideReconnect();
+      if (!LS.get("account_email", "")) rememberEmail(accessToken);
+      w?.resolve(accessToken);
     };
-    tokenClient.requestAccessToken({ prompt: interactive ? "consent" : "" });
+    const opts = { prompt: interactive ? "consent" : "" };
+    const email = LS.get("account_email", "");
+    if (email) opts.login_hint = email;
+    tokenClient.requestAccessToken(opts);
   });
 }
-async function ensureToken() {
-  if (accessToken && Date.now() < tokenExp) return accessToken;
-  return requestToken(false);
+// 계정 주소를 한 번 받아 둔다 → 다음 재발급부터 계정 선택 창 없이.
+async function rememberEmail(tok) {
+  try {
+    const r = await fetch("https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)",
+      { headers: { Authorization: "Bearer " + tok } });
+    const e = r.ok ? (await r.json())?.user?.emailAddress : "";
+    if (e) LS.set("account_email", e);
+  } catch (_) {}
 }
+const tokenFresh = () => accessToken && Date.now() < tokenExp;
+const needsRenew = () => LS.get("signed_in", false) && (!accessToken || tokenExp - Date.now() < RENEW_AHEAD_MS);
+// 터치 순간에만 부른다(팝업 허용). 이미 진행 중이면 그 결과를 함께 기다린다.
+function renewOnGesture() {
+  if (!tokenClient || renewing || !needsRenew() || !navigator.onLine) return;
+  renewing = true;
+  requestToken(false).catch(() => { renewing = false; if (!tokenFresh()) showReconnect(); });
+}
+async function ensureToken() {
+  if (tokenFresh()) return accessToken;
+  // 터치 밖에서는 팝업이 막힌다 → 기다리지 말고 '다시 연결'을 띄우고 실패시킨다.
+  showReconnect();
+  throw new Error("연결이 만료됐습니다 — 화면을 한 번 누르면 다시 연결됩니다");
+}
+// 화면 위 '다시 연결' 띠 — 누르는 것 자체가 터치라 그 순간 renewOnGesture 가 갱신한다.
+function showReconnect() {
+  if (!LS.get("signed_in", false) || document.getElementById("reconnect-bar")) return;
+  const bar = document.createElement("div");
+  bar.id = "reconnect-bar";
+  bar.textContent = "🔄 연결이 만료됐습니다 — 눌러서 다시 연결";
+  bar.style.cssText = "position:fixed;left:0;right:0;top:0;z-index:9999;padding:10px 14px;" +
+    "background:#5d4037;color:#fff;font-weight:700;text-align:center;cursor:pointer;" +
+    "padding-top:calc(10px + env(safe-area-inset-top))";
+  document.body.appendChild(bar);
+}
+function hideReconnect() { document.getElementById("reconnect-bar")?.remove(); }
 // 액세스 토큰을 서비스워커에 전달(메모리 보관). <audio src>가 Drive URL을 직접
 // 요청할 때 SW가 Authorization 헤더를 넣어준다.
 function sendTokenToSW() {
@@ -2450,18 +2503,27 @@ async function main() {
       if (swReloaded) return; swReloaded = true; location.reload();
     });
   }
-  // 이전에 로그인한 적이 있으면 로그인 화면 없이 진입 시도.
+  // 터치 순간 재발급(capture — 다른 처리보다 먼저). 만료됐거나 10분 안에 만료되면.
+  document.addEventListener("pointerdown", renewOnGesture, true);
+  document.addEventListener("keydown", renewOnGesture, true);
+  // 앱을 다시 볼 때 이미 만료됐으면 띠로 알린다(갱신은 다음 터치에서).
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && LS.get("signed_in", false) && !tokenFresh()) showReconnect();
+  });
+  // 이전에 로그인한 적이 있으면 로그인 화면 없이 진입.
   if (CLIENT_ID && LS.get("signed_in", false)) {
     // 1) 저장된 토큰이 아직 유효 → 즉시 진입(네트워크·구글 세션 불필요).
-    if (accessToken && Date.now() < tokenExp) {
+    if (tokenFresh()) {
       sendTokenToSW();
       enterApp();
       initToken().catch(() => {});   // 나중 토큰 갱신에 대비해 백그라운드 준비
       return;
     }
-    // 2) 만료됐으면 구글 세션으로 조용히 재발급(비번·동의창 없음).
-    try { await initToken(); await requestToken(false); enterApp(); return; }
-    catch { /* 조용히 실패 → 로그인 화면(원탭) */ }
+    // 2) 만료됐어도 들여보낸다 — 캐시된 곡 목록은 그대로 보이고, 첫 터치에서 조용히 재발급.
+    //    (예전엔 여기서 터치 없는 팝업을 열었다가 막혀 로그인 화면에 멈췄다)
+    initToken().catch(() => {});
+    enterApp();
+    showReconnect();
   }
 }
 main();
