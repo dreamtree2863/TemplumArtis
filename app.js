@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v37";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v38";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -1195,8 +1195,7 @@ function ensureSpaceGraph() {
     spPre.connect(spConv); spConv.connect(spWet);
     // 마지막에 리미터 — EQ 를 크게 올려도 0dBFS 를 넘겨 찢어지지 않게(평소엔 거의 손대지 않음)
     spLimit = actx.createDynamicsCompressor();
-    spLimit.threshold.value = -1; spLimit.knee.value = 0; spLimit.ratio.value = 20;
-    spLimit.attack.value = 0.002; spLimit.release.value = 0.12;
+    updateLimiter();   // 소리를 키우는 설정이 있을 때만 동작 — 평소엔 투명(원음 그대로)
     spDry.connect(spLimit); spWet.connect(spLimit); spLimit.connect(actx.destination);
     // 전화·알림·블루투스 전환으로 그래프가 멈추면(재생 표시인데 무음) 재생 중일 때 바로 되살린다
     actx.onstatechange = () => { if (actx.state !== "running" && !audio.paused) resumeAudioGraph(); };
@@ -1205,6 +1204,19 @@ function ensureSpaceGraph() {
     applyEq();                    // 저장된 EQ 설정을 실제 노드에 반영
     return true;
   } catch (_) { spaceReady = false; return false; }
+}
+// 리미터는 '소리를 키우는' 설정(EQ 부스트·프리앰프 +, 음량 평준화)이 있을 때만 건다.
+// ‼ v36 에선 늘 걸려 있어, 0dBFS 가까이 꽉 찬 요즘 마스터링을 EQ 를 꺼 둬도 미세하게 눌렀다(음질 손해).
+//   그래프가 한 번 생기면 해제할 수 없으므로(createMediaElementSource) 끄는 대신 '투명'으로 둔다.
+function updateLimiter() {
+  if (!spLimit) return;
+  const boost = (eqEnabled && (eqPreampDb > 0 || eqGains.some((g) => g > 0))) || !!LS.get("norm_fx", "");
+  if (boost) {
+    spLimit.threshold.value = -1; spLimit.knee.value = 0; spLimit.ratio.value = 20;
+    spLimit.attack.value = 0.002; spLimit.release.value = 0.12;
+  } else {
+    spLimit.threshold.value = 0; spLimit.knee.value = 0; spLimit.ratio.value = 1;   // 통과
+  }
 }
 function resumeAudioGraph() {
   if (actx && actx.state !== "running" && actx.state !== "closed") actx.resume().catch(() => {});
@@ -1247,12 +1259,13 @@ function applyNormalize(on, save) {
   on = !!on;
   if (save !== false) LS.set("norm_fx", on ? "1" : "");
   reflectNormUI(on);
-  if (!on) { if (spaceReady) setCompTransparent(); return; }
+  if (!on) { if (spaceReady) { setCompTransparent(); updateLimiter(); } return; }
   if (!ensureSpaceGraph()) { toast("이 기기에선 음량 평준화를 쓸 수 없어요."); LS.set("norm_fx", ""); reflectNormUI(false); return; }
   if (actx.state === "suspended") actx.resume().catch(() => {});
   spComp.threshold.value = -24; spComp.knee.value = 30; spComp.ratio.value = 3;
   spComp.attack.value = 0.01; spComp.release.value = 0.3;
   spMakeup.gain.value = 1.6;   // 눌린 큰음을 보상해 조용한 곡을 끌어올림
+  updateLimiter();
 }
 
 /* ───────────────────── 이퀄라이저 (10밴드 그래픽 EQ) ─────────────────────
@@ -1288,6 +1301,7 @@ function applyEq() {
   if (!eqPreamp || !eqBands) return;
   eqPreamp.gain.value = eqEnabled ? dbToGain(eqPreampDb) : 1;
   eqBands.forEach((b, i) => { try { b.gain.value = eqEnabled ? (eqGains[i] || 0) : 0; } catch (_) {} });
+  updateLimiter();
 }
 function loadEqState() {
   eqEnabled = !!LS.get("eq_on", "");
@@ -1312,10 +1326,12 @@ function setEqEnabled(on) {
 function setEqBand(i, db) {
   eqGains[i] = +db || 0; saveEqState();
   if (eqEnabled && eqBands && eqBands[i]) { try { eqBands[i].gain.value = eqGains[i]; } catch (_) {} }
+  updateLimiter();
 }
 function setEqPreamp(db) {
   eqPreampDb = +db || 0; saveEqState();
   if (eqEnabled && eqPreamp) { try { eqPreamp.gain.value = dbToGain(eqPreampDb); } catch (_) {} }
+  updateLimiter();
 }
 function applyEqPreset(name) {
   const p = EQ_PRESETS[name]; if (!p) return;
