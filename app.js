@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v36";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v37";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -1035,11 +1035,62 @@ function startPlayback(url, crossfade) {
     schedulePreloadNext();
   }
 }
+/* ── 소리 남 기다리기 · 재생 진단 · 무음 감시 ─────────────────────────── */
+let playStartAt = 0;
+// 지금 곡이 실제로 소리를 내기 시작하면(playing) 풀린다. 최대 maxMs. 그새 곡이 바뀌어도 풀린다.
+function whenAudible(gen, maxMs) {
+  return new Promise((resolve) => {
+    if (gen !== playGen) return resolve(false);
+    if (!audio.paused && audio.readyState >= 3 && audio.currentTime > 0) return resolve(true);
+    const el = audio;
+    const done = (v) => { clearTimeout(t); el.removeEventListener("playing", on); resolve(v); };
+    const on = () => done(true);
+    const t = setTimeout(() => done(false), maxMs);
+    el.addEventListener("playing", on);
+  });
+}
+// 재생 진단 기록(설정 › 재생 진단) — 폰에서만 생기는 문제를 나중에 확인하려고 남긴다.
+function playDiag(kind, detail) {
+  const t = curIndex >= 0 ? library[curIndex] : null;
+  const log = LS.get("play_diag", []);
+  log.unshift({ ts: Date.now(), kind, detail: detail || "", track: t ? (t.title || t.name || "").slice(0, 40) : "" });
+  LS.set("play_diag", log.slice(0, 40));
+  if (activeTab === "settings") renderSettings();
+}
+// 무음 감시 — 재생 중인데 소리가 안 나는 세 가지 경우를 1초마다 확인해 스스로 고친다.
+//  ① 볼륨이 0에 머묾(크로스페이드 페이드가 끝나지 못함) — 예전엔 일시정지→재생을 눌러야 1로 돌아왔다
+//  ② 효과 그래프(EQ·공간감·평준화)가 멈춤 — 재생 표시인데 무음
+//  ③ 스트림이 멈춤(6초 넘게 위치가 그대로) — 같은 위치에서 다시 받는다
+let fadingOut = false, wdLastPos = -1, wdStuckSince = 0, wdTimer = null;
+function watchdog() {
+  if (audio.paused || !audio.src) { wdStuckSince = 0; wdLastPos = -1; return; }
+  if (!fadeTimer && !fadingOut && crossfadeOK && audio.volume < 0.05) {
+    try { audio.volume = 1; } catch (_) {}
+    playDiag("볼륨 0 복구", "페이드가 끝나지 않은 채 멈춰 있었음");
+  }
+  if (actx && spaceReady && actx.state !== "running" && actx.state !== "closed") {
+    resumeAudioGraph();
+    playDiag("효과 그래프 재개", "상태: " + actx.state);
+  }
+  const pos = audio.currentTime;
+  if (Math.abs(pos - wdLastPos) > 0.05) { wdLastPos = pos; wdStuckSince = 0; return; }
+  if (!wdStuckSince) { wdStuckSince = Date.now(); return; }
+  if (Date.now() - wdStuckSince > 6000 && navigator.onLine) {
+    wdStuckSince = 0;
+    playDiag("스트림 멈춤", `${pos.toFixed(1)}초에서 6초 넘게 멈춤 · 준비상태 ${audio.readyState} · 다시 받음`);
+    onStreamError();
+  }
+}
+function startWatchdog() { if (!wdTimer) wdTimer = setInterval(watchdog, 1000); }
+
 // play() 거절 처리 — 자동재생 차단(NotAllowedError)이면 ▶ 로 되돌려 사용자가 누르게 한다.
 // AbortError(그새 src 가 바뀜)는 정상. 스트림 오류는 'error' 이벤트(onStreamError)가 맡는다.
 function safePlay(el) {
   const p = el.play();
-  if (p && p.catch) p.catch((e) => { if (e && e.name === "NotAllowedError" && el === audio) setPlayIcons(false); });
+  if (p && p.catch) p.catch((e) => {
+    if (e && e.name === "NotAllowedError" && el === audio) { setPlayIcons(false); playDiag("재생 거절", "브라우저가 자동재생을 막음 — ▶ 를 눌러야 함"); }
+  });
+  startWatchdog();
   return p;
 }
 function setPlayIcons(state) {   // true=재생 중, false=멈춤, "wait"=불러오는 중
@@ -1338,9 +1389,10 @@ function sleepFire() {
 function fadeOutAndPause() {
   if (!crossfadeOK) { audio.pause(); return; }
   let v = audio.volume;
+  fadingOut = true;   // 슬립 타이머 페이드아웃 중엔 무음 감시가 볼륨을 되돌리지 않게
   const iv = setInterval(() => {
     v -= 0.05; try { audio.volume = Math.max(0, v); } catch (_) {}
-    if (v <= 0) { clearInterval(iv); audio.pause(); try { audio.volume = 1; } catch (_) {} }
+    if (v <= 0) { clearInterval(iv); audio.pause(); try { audio.volume = 1; } catch (_) {} fadingOut = false; }
   }, 80);
 }
 function reflectSleep() {
@@ -1462,17 +1514,19 @@ async function playByLibIndex(i, opts = {}) {
   refresh();
   $("#lyrics").innerHTML = `<div class="spinner"></div>`;
 
+  playStartAt = performance.now();   // 누른 순간 → 실제 소리까지 걸린 시간을 진단 기록에 남긴다
   // 캐시된 커버가 있으면 다운로드를 기다리지 않고 즉시 표시(가장 큰 체감 개선).
-  getCachedCover(track).then((url) => {
-    if (!url) return;
-    if (i !== curIndex || shownCoverForId === track.id) { URL.revokeObjectURL(url); return; }
+  const cachedCover = getCachedCover(track).then((url) => {
+    if (!url) return false;
+    if (i !== curIndex || shownCoverForId === track.id) { URL.revokeObjectURL(url); return true; }
     if (curCoverUrl) URL.revokeObjectURL(curCoverUrl);
     curCoverUrl = url; shownCoverForId = track.id;
     setCoverImg("#cover", url); setCoverImg("#mini-art", url);
+    return true;
   });
-  // 캐시에 없으면 공유 커버 파일을 병렬로 빠르게 받아 표시한다(무거운 256KB 태그
-  // fetch를 기다리지 않음). 태그 fetch의 임베디드 커버는 뒤에서 폴백으로만 쓴다.
-  storeCoverBytes(track).then((cov) => {
+  // 캐시에 없으면 공유 커버 파일을 받는다 — 단, **소리가 난 뒤에**(최대 1.5초 대기).
+  // 예전엔 누르자마자 커버·태그(256KB)를 음악 스트림과 동시에 받아, 첫 소리가 그만큼 늦었다.
+  cachedCover.then((has) => has ? null : whenAudible(gen, 1500).then(() => gen === playGen ? storeCoverBytes(track) : null)).then((cov) => {
     if (!cov || i !== curIndex || shownCoverForId === track.id) { cov && coverDiagNote("store", cov.data.length); return; }
     putCachedCover(track, cov.data, cov.mime);
     const u = URL.createObjectURL(new Blob([cov.data], { type: cov.mime }));
@@ -1491,6 +1545,9 @@ async function playByLibIndex(i, opts = {}) {
     startPlayback(driveUrl(track.id), opts.crossfade !== false);
     advancing = false;             // 새 곡이 붙었다 — 이제 다음 곡 끝에서 다시 넘길 수 있다
     // 메타/커버/가사 — 태그만 '딱 필요한 만큼' 받아 파싱(1MB 고정 아님).
+    // 첫 소리를 먼저 — 소리가 나거나 4초가 지난 뒤에 받는다(제목은 목록에서 읽어 둔 값이 이미 떠 있다)
+    await whenAudible(gen, 4000);
+    if (gen !== playGen) return;
     const buf = await fetchTagExact(track.id);
     if (gen !== playGen) return;   // 그새 다른 곡으로 넘어갔으면 무시
     if (buf) {
@@ -1977,6 +2034,19 @@ async function renderSettings() {
       ["사용량", storage, ""],
       ["커버 캐시", `${LS.get(COVER_KEYS, []).length}개`, ""],
     ]) + `<div class="set-actions">${setBtn("clear-covers", "커버 캐시 비우기")}</div>`)
+    + setCard("재생 진단", (() => {
+      const lat = LS.get("play_lat", []);
+      const med = lat.length ? lat.slice().sort((a, b) => a - b)[Math.floor(lat.length / 2)] : 0;
+      const d = LS.get("play_diag", []).slice(0, 10);
+      return setRows([
+        [`누른 뒤 첫 소리(최근 ${lat.length}곡 중앙값)`, lat.length ? `${(med / 1000).toFixed(1)}초 · 최장 ${(Math.max(...lat) / 1000).toFixed(1)}초` : "기록 없음",
+          !lat.length ? "" : med < 2500 ? "good" : "warn"],
+      ]) + (d.length ? `<div class="set-log">${d.map((x) =>
+          `<div class="bad">${when(x.ts)} · ${escapeHtml(x.kind)} — ${escapeHtml(x.detail)}${x.track ? " · " + escapeHtml(x.track) : ""}</div>`).join("")}</div>`
+        : `<p class="set-note">자동으로 고친 재생 문제가 없습니다.</p>`)
+        + `<p class="set-note">소리가 안 나거나 늦을 때 앱이 스스로 고친 내용이 여기 남습니다. 같은 증상이 계속되면 이 기록으로 원인을 확인합니다.</p>`
+        + `<div class="set-actions">${setBtn("diag-clear", "기록 지우기")}</div>`;
+    })())
     + setCard("앱 정보", setRows([
       ["버전", APP_VERSION, "good"],
       ["Client ID", CLIENT_ID ? CLIENT_ID.slice(0, 14) + "…" : "없음", CLIENT_ID ? "" : "warn"],
@@ -2057,6 +2127,8 @@ async function onSettingsAction(act) {
   } else if (act === "clear-covers") {
     try { await caches.delete(COVER_CACHE); } catch (_) {}
     LS.set(COVER_KEYS, []); toast("커버 캐시를 비웠습니다.");
+  } else if (act === "diag-clear") {
+    LS.set("play_diag", []); LS.set("play_lat", []);
   } else if (act === "update") {
     try { const reg = await navigator.serviceWorker?.getRegistration(); await reg?.update(); } catch (_) {}
     toast("확인했습니다 — 새 버전이 있으면 자동으로 다시 열립니다.");
@@ -3027,6 +3099,7 @@ function bind() {
 let errRetry = { id: null, n: 0, okAt: 0 }, errSkips = 0, onlineResume = null;
 async function onStreamError() {
   const id = curId; if (!id) return;
+  if (audio.error) playDiag("스트림 오류", `코드 ${audio.error.code}${audio.error.message ? " · " + audio.error.message.slice(0, 60) : ""}`);
   const pos = audio.currentTime || 0;
   // 새 곡이거나, 다시 받은 뒤 20초 넘게 잘 나왔으면 재시도 횟수를 새로 센다(긴 곡의 끊김 여러 번)
   if (errRetry.id !== id || (errRetry.okAt && Date.now() - errRetry.okAt > 20000)) errRetry = { id, n: 0, okAt: 0 };
@@ -3079,7 +3152,16 @@ function bindAudioEvents(el) {
   el.addEventListener("ended", function () { if (this === audio && !advancing) nextTrack(true); });
   // 버퍼링 중(…)과 실제 소리가 나는 순간(❚❚)을 구분해 보여 준다 — 지하철에서 '멈춘 건지 받는 중인지'
   el.addEventListener("waiting", function () { if (this === audio && !this.paused) setPlayIcons("wait"); });
-  el.addEventListener("playing", function () { if (this === audio) { setPlayIcons(true); errSkips = 0; errRetry.okAt = Date.now(); } });
+  el.addEventListener("playing", function () {
+    if (this !== audio) return;
+    setPlayIcons(true); errSkips = 0; errRetry.okAt = Date.now();
+    wdStuckSince = 0; wdLastPos = this.currentTime;
+    if (playStartAt) {   // 누른 순간 → 첫 소리
+      const ms = Math.round(performance.now() - playStartAt); playStartAt = 0;
+      const lat = LS.get("play_lat", []); lat.unshift(ms); LS.set("play_lat", lat.slice(0, 20));
+      if (ms > 3000) playDiag("늦은 시작", `${(ms / 1000).toFixed(1)}초 만에 소리`);
+    }
+  });
   el.addEventListener("error", function () { if (this === audio && this.getAttribute("src")) onStreamError(); });
   // 잠금화면 진행바는 위치가 튈 때 바로 맞춘다(예전엔 최대 2초 늦게 따라왔다)
   for (const ev of ["seeked", "durationchange", "ratechange"])
