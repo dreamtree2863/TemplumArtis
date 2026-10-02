@@ -4,7 +4,7 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v38";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v39";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
@@ -1211,9 +1211,11 @@ function ensureSpaceGraph() {
 function updateLimiter() {
   if (!spLimit) return;
   const boost = (eqEnabled && (eqPreampDb > 0 || eqGains.some((g) => g > 0))) || !!LS.get("norm_fx", "");
+  // ‼ -1dB·어택 2ms 로는 크롬 컴프레서(자동 메이크업 게인 포함)가 피크를 못 잡아 0dBFS 를 넘겨 찢어졌다
+  //   (v38 실측: 평준화 켜면 Believer 11초에 3,970샘플 클리핑). -3dB·1ms 로 잡으면 피크 0.98 이하·클리핑 0.
   if (boost) {
-    spLimit.threshold.value = -1; spLimit.knee.value = 0; spLimit.ratio.value = 20;
-    spLimit.attack.value = 0.002; spLimit.release.value = 0.12;
+    spLimit.threshold.value = -3; spLimit.knee.value = 0; spLimit.ratio.value = 20;
+    spLimit.attack.value = 0.001; spLimit.release.value = 0.1;
   } else {
     spLimit.threshold.value = 0; spLimit.knee.value = 0; spLimit.ratio.value = 1;   // 통과
   }
@@ -1264,7 +1266,9 @@ function applyNormalize(on, save) {
   if (actx.state === "suspended") actx.resume().catch(() => {});
   spComp.threshold.value = -24; spComp.knee.value = 30; spComp.ratio.value = 3;
   spComp.attack.value = 0.01; spComp.release.value = 0.3;
-  spMakeup.gain.value = 1.6;   // 눌린 큰음을 보상해 조용한 곡을 끌어올림
+  // 눌린 큰음을 보상해 조용한 곡을 끌어올림. 크롬 컴프레서가 자체 메이크업 게인을 이미 더하므로
+  // 1.6(+4dB)이면 큰 곡까지 키워 클리핑됐다. 1.25 면 곡 간 차이 축소는 같고(14.7→9.5dB) 클리핑은 없다.
+  spMakeup.gain.value = 1.25;
   updateLimiter();
 }
 
