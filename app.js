@@ -4,14 +4,22 @@
 "use strict";
 
 /* ───────────────────── 유틸 ───────────────────── */
-const APP_VERSION = "v35";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
+const APP_VERSION = "v36";  // 화면에 표시 — 폰이 최신 코드인지 눈으로 확인용
 const CROSSFADE_MS = 800;   // 곡 전환 시 교차 페이드 길이(데스크톱과 동일)
 const FADE_STEP_MS = 40;    // 페이드 갱신 간격
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const LS = {
   get: (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
-  set: (k, v) => localStorage.setItem(k, JSON.stringify(v)),
+  // 저장 공간(약 5MB)이 차면 setItem 이 예외를 던진다. 예전엔 그대로 터져 재생목록 저장 등이
+  // 조용히 멈췄다. 이제 실패를 돌려주고 한 번 알린다(커버 캐시는 Cache API 라 여기 포함 안 됨).
+  set: (k, v) => {
+    try { localStorage.setItem(k, JSON.stringify(v)); return true; }
+    catch (e) {
+      if (!LS._warned) { LS._warned = true; setTimeout(() => toast("폰 저장 공간(앱 설정 영역)이 가득 찼습니다 — 재생목록 커버 사진을 줄여 주세요."), 0); }
+      console.warn("LS.set 실패", k, e); return false;
+    }
+  },
 };
 // 음악은 읽기 전용(drive.readonly). 플레이리스트는 음악 폴더의 _playlists.json으로
 // PC와 공유하며, 그 파일을 쓰려면 쓰기 권한이 필요하다. 사용자 파일 전체가 아니라
@@ -59,9 +67,16 @@ let curLyricLine = -1;
 let playlists = [];          // [{id, name, rel:[상대경로], ts}] — syncPlaylists에서 로드
 let plTombs = {};            // {id: ts} 삭제 기록(PC에도 전파)
 let selectedPlaylistId = null;   // 상세 뷰로 열어본 플레이리스트(null이면 목록)
-let plQueue = null;          // 재생 큐(플레이리스트 재생 시 라이브러리 인덱스 배열)
-let plQueuePos = -1;         // 큐 내 현재 위치
-let upNext = [];             // 사용자 지정 재생큐(다음에 재생/큐에 추가) — 곡 id 배열, 세션 한정
+/* 재생 대기열 — **곡 id** 로 들고 있는다(라이브러리 번호는 새로고침·정렬 때 바뀐다).
+   queue  : 재생을 시작한 맥락(화면에 보이던 목록·앨범·플레이리스트)의 곡 id, 보이던 순서 그대로
+   qOrder : queue 위치의 재생 순서. 셔플이면 섞인 순열 → '이전 곡'이 곧 직전에 들은 곡이 된다
+   qPos   : qOrder 안 현재 위치
+   (예전엔 라이브러리 배열 순서로 다음 곡을 골라, 정렬·검색 화면과 다음 곡이 달랐다) */
+let queue = [], qOrder = [], qPos = -1;
+let curId = null;            // 지금 재생 중인 곡 id — curIndex 는 여기서 다시 계산한다
+let idIndex = new Map();     // 곡 id → library 번호
+let playGen = 0;             // 재생 요청 세대 — 늦게 끝난 옛 요청이 새 곡을 덮지 않게
+let upNext = LS.get("upnext", []) || [];   // 사용자 지정 재생큐(다음에 재생/큐에 추가) — 곡 id 배열, 앱을 다시 열어도 유지
 let pendingCoverPl = null;   // 커버 사진 선택 중인 플레이리스트 id
 let pickerPlId = null;       // '곡 추가' 피커가 대상으로 하는 플레이리스트 id
 let activeTab = "library";
@@ -307,11 +322,13 @@ function sendTokenToSW() {
     (navigator.serviceWorker.controller || reg.active)?.postMessage({ type: "token", token: tok, broker: cfg });
   }).catch(() => {});
 }
+let lastTagStatus = 0;   // 마지막 태그 요청의 HTTP 상태 — 요청 제한(403/429)이면 잠시 쉰다
 // 태그(메타/커버/USLT)만 파싱하려고 파일 앞부분(ID3v2 영역)만 Range로 받는다.
 async function fetchTagBytes(fileId, lastByte = 1048575) {
   const token = await ensureToken();
   const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&supportsAllDrives=true`;
   const r = await fetch(url, { headers: { Authorization: "Bearer " + token, Range: `bytes=0-${lastByte}` }, cache: "no-store" });
+  lastTagStatus = r.status;
   if (!r.ok && r.status !== 206) return null;
   return r.arrayBuffer();
 }
@@ -336,22 +353,52 @@ const COVER_CACHE = "ta-covers";
 const COVER_KEYS = "cover_keys";
 const COVER_MAX = 500;   // 최근 재생·프리페치한 커버 보관 수(대략 40~60MB)
 function coverKey(t) { return `cover/${t.id}:${t.size || 0}`; }
+// 반환 URL 은 호출부가 직접 revoke 한다(재생 화면처럼 곡이 바뀌면 버리는 곳).
 async function getCachedCover(t) {
   try {
     const c = await caches.open(COVER_CACHE);
-    const r = await c.match(coverKey(t));
+    const key = coverKey(t);
+    const r = await c.match(key);
     if (!r) return null;
+    touchCoverKey(key);
     return URL.createObjectURL(await r.blob());
   } catch (_) { return null; }
+}
+// 목록 썸네일·앨범 상세처럼 revoke 할 곳이 없는 호출부용 — 같은 곡은 같은 URL 을 다시 쓴다.
+// (예전엔 목록을 다시 그릴 때마다 커버 URL 을 새로 만들고 버리지 않아 메모리가 계속 늘었다)
+const sharedCoverUrls = new Map();   // coverKey → objectURL (최대 150개, 오래된 것부터 revoke)
+async function getSharedCover(t) {
+  if (!t) return null;
+  const key = coverKey(t);
+  if (sharedCoverUrls.has(key)) { const u = sharedCoverUrls.get(key); sharedCoverUrls.delete(key); sharedCoverUrls.set(key, u); return u; }
+  const u = await getCachedCover(t);
+  if (!u) return null;
+  if (sharedCoverUrls.has(key)) { URL.revokeObjectURL(u); return sharedCoverUrls.get(key); }
+  sharedCoverUrls.set(key, u);
+  while (sharedCoverUrls.size > 150) { const [k, old] = sharedCoverUrls.entries().next().value; sharedCoverUrls.delete(k); URL.revokeObjectURL(old); }
+  return u;
+}
+// 커버를 볼 때마다 '최근'으로 올린다 — 예전엔 넣은 순서로만 지워져(FIFO) 자주 듣는 곡 커버도 밀려났다.
+let coverKeysMem = null, coverKeysTimer = null;
+function touchCoverKey(key) {
+  if (!coverKeysMem) coverKeysMem = LS.get(COVER_KEYS, []);
+  const i = coverKeysMem.indexOf(key);
+  if (i === coverKeysMem.length - 1) return;
+  if (i >= 0) coverKeysMem.splice(i, 1);
+  coverKeysMem.push(key);
+  clearTimeout(coverKeysTimer);
+  coverKeysTimer = setTimeout(() => LS.set(COVER_KEYS, coverKeysMem), 2000);
 }
 async function putCachedCover(t, bytes, mime) {
   try {
     const c = await caches.open(COVER_CACHE);
     const key = coverKey(t);
     await c.put(key, new Response(new Blob([bytes], { type: mime || "image/jpeg" })));
-    let keys = LS.get(COVER_KEYS, []).filter((k) => k !== key);
+    if (!coverKeysMem) coverKeysMem = LS.get(COVER_KEYS, []);
+    const keys = coverKeysMem.filter((k) => k !== key);
     keys.push(key);
     while (keys.length > COVER_MAX) { const old = keys.shift(); c.delete(old).catch(() => {}); }
+    coverKeysMem = keys;
     LS.set(COVER_KEYS, keys);
   } catch (_) {}
 }
@@ -369,8 +416,11 @@ async function relHash(rel) {
 async function ensureCoverMap() {
   if (coverMap) return coverMap;
   if (coverMapLoading) return coverMapLoading;
+  // ‼ 예전엔 음악 폴더를 아직 모르거나(첫 실행)·오프라인이면 빈 결과를 영구히 굳혀,
+  //   PC 가 _covers 를 만든 뒤에도 앱을 지우기 전까지 공유 커버를 안 썼다. 이제 성공했을 때만 캐시한다.
   coverMapLoading = (async () => {
     const map = {};
+    let ok = false;
     try {
       if (!plParentId) { plParentId = LS.get("pl_parent", null); }
       if (!plParentId) return map;
@@ -380,17 +430,18 @@ async function ensureCoverMap() {
       const fr = await fetch(
         `https://www.googleapis.com/drive/v3/files?q=${fq}&fields=files(id)&pageSize=1&spaces=drive`,
         { headers: { Authorization: "Bearer " + token } }).then((r) => (r.ok ? r.json() : null));
-      coverFolderId = fr && fr.files && fr.files[0] ? fr.files[0].id : null;
-      if (!coverFolderId) return map;
+      if (!fr) throw new Error("cover folder");
+      coverFolderId = fr.files && fr.files[0] ? fr.files[0].id : null;
+      if (!coverFolderId) { ok = true; return map; }   // 폴더가 정말 없음 — 이건 확정
       let pageToken = "";
       do {
         const q = encodeURIComponent(`'${coverFolderId}' in parents and trashed=false`);
         const url = `https://www.googleapis.com/drive/v3/files?q=${q}` +
           `&fields=nextPageToken,files(id,name)&pageSize=1000&spaces=drive` +
-          (pageToken ? `&pageToken=${pageToken}` : "");
+          (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "");
         const data = await fetch(url, { headers: { Authorization: "Bearer " + token } })
           .then((r) => (r.ok ? r.json() : null));
-        if (!data) break;
+        if (!data) throw new Error("cover list");
         for (const f of data.files || []) {
           const key = (f.name || "").replace(/\.jpg$/i, "");
           if (key) map[key] = f.id;
@@ -415,8 +466,12 @@ async function ensureCoverMap() {
           }
         }
       }
-    } catch (_) {}
-    coverMap = map;
+      ok = true;
+    } catch (_) {
+    } finally {
+      if (ok) coverMap = map;
+      coverMapLoading = null;
+    }
     return map;
   })();
   return coverMapLoading;
@@ -448,8 +503,7 @@ function coverDiagNote(kind, bytes) {
   const msg = coverDiag.store
     ? `커버: 공유 파일 ${coverDiag.store}/${coverDiag.done} · 평균 ${avg}KB ✓`
     : `커버: 공유 파일 없음 → 임베디드 폴백 (PC가 아직 생성 중일 수 있음)`;
-  console.log("[coverDiag]", msg, coverDiag);
-  toast(msg);
+  console.log("[coverDiag]", msg, coverDiag);   // 예전엔 앱을 열 때마다 알림으로 떴다 — 이제 콘솔만
 }
 
 // 진단: _covers 폴더에 공유 커버가 몇 개 있는지 한 번 알린다(PC 생성 여부 확인용).
@@ -460,12 +514,8 @@ async function probeCoverStore() {
   try {
     const map = await ensureCoverMap();
     const n = Object.keys(map).length;
-    toast(n ? `공유 커버 ${n}개 감지 — 커버 파일 사용 ✓`
-            : `공유 커버 폴더(_covers) 비어있음 — PC에서 생성 필요/진행중`);
     console.log("[coverProbe] _covers files:", n, "folderId:", coverFolderId);
-  } catch (e) {
-    toast("커버 진단 오류: " + (e && e.message || e));
-  }
+  } catch (e) { console.warn("[coverProbe]", e); }
 }
 
 // 한 곡 커버를 백그라운드로 미리 받아 캐시. 먼저 공유 커버 파일(작고 빠름),
@@ -486,11 +536,18 @@ async function prefetchCover(t) {
 // 현재 곡 다음 N곡의 커버를 순서대로 미리 받는다(스킵/자동재생 시 즉시 표시).
 // 한꺼번에 몰아 받지 않고 하나씩 이어 받아 재생 스트림 대역폭을 덜 뺏는다.
 let prefetchGen = 0;
-async function prefetchCoversAhead(fromIndex, n) {
+async function prefetchCoversAhead(_fromIndex, n) {
   const gen = ++prefetchGen;               // 곡이 바뀌면 이전 프리페치는 중단
-  for (let k = 1; k <= n; k++) {
+  // 실제로 다음에 나올 곡들(재생큐 → 대기열 순서, 셔플 포함) — 라이브러리 배열 순서가 아니다
+  const ids = upNext.slice(0, n);
+  for (let p = qPos; ids.length < n;) {
+    p = queueStep(p, +1, repeat === "all");
+    if (p < 0 || p === qPos) break;
+    ids.push(queue[qOrder[p]]);
+  }
+  for (const id of ids) {
     if (gen !== prefetchGen) return;
-    await prefetchCover(library[fromIndex + k]);
+    await prefetchCover(library[libIdx(id)]);
   }
 }
 
@@ -548,16 +605,17 @@ async function resolveFolderPath(path) {
 // 지정 폴더들의 오디오 파일만 하위 폴더까지 재귀로 수집(드라이브 전체 아님).
 // 각 곡에 음악 폴더 기준 상대경로(rel)를 붙인다 — PC와 공유하는 곡 식별 열쇠.
 async function listFolderAudio(rootIds, onProgress) {
+  // 폴더마다 순서대로 하나씩 물으면 날짜 폴더가 수백 개일 때 수백 번 왕복을 기다렸다.
+  // 이제 폴더를 4개씩 동시에 훑는다(Drive 동시 요청 한도 안쪽).
   const out = [], seen = new Set();
   const queue = rootIds.map((id) => ({ id, prefix: "" }));   // 루트는 prefix 없음
-  while (queue.length) {
-    const { id: parent, prefix } = queue.shift();
+  async function listOne({ id: parent, prefix }) {
     let pageToken = "";
     do {
       const q = encodeURIComponent(`'${parent}' in parents and trashed=false`);
       const url = `https://www.googleapis.com/drive/v3/files?q=${q}` +
         `&fields=nextPageToken,files(id,name,size,mimeType)&pageSize=1000&orderBy=name&spaces=drive` +
-        (pageToken ? `&pageToken=${pageToken}` : "");
+        (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "");
       const data = await driveFetch(url, false);
       for (const f of data.files || []) {
         if (f.mimeType === "application/vnd.google-apps.folder") {
@@ -573,7 +631,20 @@ async function listFolderAudio(rootIds, onProgress) {
       onProgress && onProgress(out.length);
     } while (pageToken);
   }
-  out.sort((a, b) => a.title.localeCompare(b.title, "ko"));
+  let active = 0, failed = null;
+  await new Promise((resolve) => {
+    const pump = () => {
+      if (failed) { if (!active) resolve(); return; }
+      while (active < 4 && queue.length) {
+        active++;
+        listOne(queue.shift()).catch((e) => { failed = e; }).finally(() => { active--; pump(); });
+      }
+      if (!active && !queue.length) resolve();
+    };
+    pump();
+  });
+  if (failed) throw failed;   // 일부만 받은 목록으로 라이브러리를 바꾸지 않는다
+  out.sort((a, b) => collator.compare(a.title, b.title));
   return out;
 }
 
@@ -590,10 +661,11 @@ function decodeText(bytes, enc) {
 }
 function parseID3(buf) {
   const v = new Uint8Array(buf);
-  const meta = { title: "", artist: "", album: "", year: "", genre: "", cover: null, uslt: "" };
+  const meta = { title: "", artist: "", album: "", year: "", genre: "", track: 0, albumArtist: "", cover: null, uslt: "", tagSize: 0 };
   if (v.length < 10 || v[0] !== 0x49 || v[1] !== 0x44 || v[2] !== 0x33) return meta; // "ID3"
   const ver = v[3];
   const size = synchsafe(v[6], v[7], v[8], v[9]);
+  meta.tagSize = 10 + size;   // 받은 바이트보다 크면 태그가 잘린 것(앞쪽에 큰 커버) — 호출부가 다시 받는다
   let pos = 10;
   const end = Math.min(10 + size, v.length);
   const idOf = (p) => String.fromCharCode(v[p], v[p + 1], v[p + 2], v[p + 3]);
@@ -616,6 +688,8 @@ function parseID3(buf) {
       else if (id === "TALB") meta.album = txt;
       else if (id === "TCON") meta.genre = txt;
       else if (id === "TYER" || id === "TDRC") meta.year = txt.slice(0, 4);
+      else if (id === "TRCK") meta.track = parseInt(txt) || 0;      // "3/12" → 3
+      else if (id === "TPE2") meta.albumArtist = txt;
     } else if (id === "APIC") {                // 앨범아트
       let p = 1;
       const enc = body[0];
@@ -665,9 +739,10 @@ function sortKey(t) {
   if (sortMode === "genre") return (t.genre || _SORT_TAIL);
   return t.title || _SORT_TAIL;
 }
+// Collator 하나를 재사용 — localeCompare(…, "ko") 는 비교할 때마다 새로 만들어 2,200곡 정렬이 느렸다
+const collator = new Intl.Collator("ko", { numeric: true });
 function sortTracks(arr) {
-  return arr.sort((a, b) =>
-    sortKey(a).localeCompare(sortKey(b), "ko") || (a.title || "").localeCompare(b.title || "", "ko"));
+  return arr.sort((a, b) => collator.compare(sortKey(a), sortKey(b)) || collator.compare(a.title || "", b.title || ""));
 }
 // 검색 정규화: 소문자 + NFC + 공백/괄호/기호 제거. '여자친구 (GFRIEND)'가 '여자친구',
 // 'gfriend', '여자친구(gfriend)' 어느 걸로 쳐도 잡히고, 띄어쓰기·대소문자 차이를 무시한다.
@@ -677,8 +752,14 @@ function normSearch(s) {
 function applySearch() {
   const raw = $("#search").value.trim();
   const q = normSearch(raw);
+  // 곡마다 정규화한 검색 문자열을 한 번만 만들어 둔다(태그가 바뀌면 다시). 필드 사이에 구분자를
+  // 넣어 '제목 끝 + 가수 앞'이 붙어 엉뚱하게 걸리던 것도 막는다.
   filtered = q
-    ? library.filter((t) => normSearch(t.title + t.artist + (t.album || "") + t.name).includes(q))
+    ? library.filter((t) => {
+        const src = t.title + "|" + t.artist + "|" + (t.album || "") + "|" + t.name;
+        if (t._sk !== src) { t._sk = src; t._sn = src.split("|").map(normSearch).join("\u0001"); }
+        return t._sn.includes(q);
+      })
     : library.slice();
   sortTracks(filtered);
   render();
@@ -701,14 +782,14 @@ const V_ROW = 62;      // 행 높이(px, .track 기준). 첫 렌더 후 실측�
 const V_BUFFER = 6;    // 화면 위아래로 미리 그려둘 행 수
 let vRowH = V_ROW, vStart = -1, vEnd = -1;
 function rowHtml(t) {
-  const playing = t.id === library[curIndex]?.id ? " playing" : "";
+  const playing = t.id === curId ? " playing" : "";
   return `<div class="track${playing}" data-id="${t.id}">
       <div class="track-thumb">♪</div>
       <div class="track-body">
         <div class="track-title">${escapeHtml(t.title)}</div>
         <div class="track-artist">${escapeHtml(t.artist || "알 수 없는 아티스트")}</div>
       </div>
-      <button class="track-add" data-add="${t.id}">＋</button>
+      <button class="track-add" data-add="${t.id}" aria-label="플레이리스트에 담기">＋</button>
     </div>`;
 }
 function renderList() {
@@ -738,7 +819,7 @@ function renderWindow(force) {
   inner.innerHTML = filtered.slice(start, end).map(rowHtml).join("");
   vStart = start; vEnd = end;
   // 보이는 곡의 실제 태그를 읽어 채운다(태그 우선, 없으면 파일명 추정 유지).
-  for (const t of filtered.slice(start, end)) queueEnrich(t);
+  for (const t of filtered.slice(start, end)) queueEnrich(t, true);
   // 실제 행 높이를 한 번 재서 보정(폰 글꼴/배율에 따라 달라짐).
   if (force) {
     const first = inner.querySelector(".track");
@@ -759,32 +840,48 @@ function renderAlbums() {
     box.innerHTML = `<div class="entries-empty">${library.length ? "검색 결과가 없습니다." : "곡이 없습니다."}</div>`;
     return;
   }
+  // 앨범 이름 + 폴더로 묶는다 — 이름만 보면 서로 다른 가수의 "Greatest Hits"·"Best" 가 한 앨범이 됐다.
+  // 한 앨범은 보통 한 폴더에 있으니 폴더를 함께 보면 갈리고, 여러 가수가 모인 컴필레이션은 그대로 한 묶음.
   const groups = new Map();
   for (const t of filtered) {
-    const key = t.album || "(앨범 미확인)";
+    const key = albumKey(t);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(t);
   }
   // 앨범을 골라 열어둔 상태면 그 앨범의 곡 목록(상세)을 보여준다.
   if (selectedAlbum && groups.has(selectedAlbum)) { renderAlbumDetail(selectedAlbum, groups.get(selectedAlbum)); return; }
   selectedAlbum = null;
-  const cards = [...groups.entries()].map(([album, ts]) => {
+  const cards = [...groups.entries()].map(([key, ts]) => {
     const ids = ts.map((t) => t.id).join(",");
-    return `<div class="album-card" data-ids="${ids}" data-album="${escapeHtml(album)}">
+    return `<div class="album-card" data-ids="${ids}" data-album="${escapeHtml(key)}">
       <div class="album-art">♪</div>
       <div class="album-cap">
-        <div class="album-name">${escapeHtml(album)}</div>
-        <div class="album-artist">${escapeHtml(ts[0].artist || "")} · ${ts.length}곡</div>
+        <div class="album-name">${escapeHtml(ts[0].album || "(앨범 미확인)")}</div>
+        <div class="album-artist">${escapeHtml(albumArtistOf(ts))} · ${ts.length}곡</div>
       </div>
     </div>`;
   }).join("");
   box.innerHTML = `<div class="album-grid">${cards}</div>`;
 }
+function albumKey(t) {
+  if (!t.album) return "(앨범 미확인)";
+  const rel = t.rel || "", slash = rel.lastIndexOf("/");
+  return t.album + " |:| " + (slash > 0 ? rel.slice(0, slash) : "");
+}
+// 앨범 대표 가수: 앨범 아티스트(TPE2) → 모든 곡이 같은 가수면 그 가수 → 아니면 '여러 아티스트'
+function albumArtistOf(ts) {
+  const aa = ts.find((t) => t.albumArtist)?.albumArtist;
+  if (aa) return aa;
+  const set = new Set(ts.map((t) => t.artist).filter(Boolean));
+  return set.size === 1 ? [...set][0] : set.size ? "여러 아티스트" : "";
+}
 // 앨범 상세: 헤더(커버·정보·전체/셔플 재생) + 곡 목록. PC 앨범 상세와 결을 맞춤.
-function renderAlbumDetail(album, ts) {
+function renderAlbumDetail(albumKeyStr, ts) {
   const box = $("#track-list");
-  const tracks = ts.slice().sort((a, b) => (a.title || "").localeCompare(b.title || "", "ko"));
-  const artist = tracks[0].artist || "";
+  const album = ts[0].album || "(앨범 미확인)";
+  // 트랙 번호(TRCK) 순 — 번호가 없는 곡(예전에 읽은 캐시)은 뒤에 제목순
+  const tracks = ts.slice().sort((a, b) => ((a.track || 9999) - (b.track || 9999)) || collator.compare(a.title || "", b.title || ""));
+  const artist = albumArtistOf(tracks);
   const years = [...new Set(tracks.map((t) => t.year).filter(Boolean))].sort();
   const rows = tracks.map((t) => `
     <div class="track" data-id="${t.id}">
@@ -811,9 +908,13 @@ function renderAlbumDetail(album, ts) {
       <div class="ad-tracks">${rows}</div>
     </div>`;
   const first = tracks[0];
-  getCachedCover(first).then((url) => {
-    if (url) return setAdArt(url);
-    storeCoverBytes(first).then((c) => { if (c) setAdArt(URL.createObjectURL(new Blob([c.data], { type: c.mime }))); });
+  // 커버가 늦게 와도 다른 앨범 화면에 붙지 않게 — 받는 동안 지금 열린 앨범이 그대로인지 확인
+  const still = () => selectedAlbum === albumKeyStr;
+  getSharedCover(first).then(async (url) => {
+    if (url) return still() && setAdArt(url);
+    await prefetchCover(first);
+    const u = await getSharedCover(first);
+    if (u && still()) setAdArt(u);
   });
 }
 function setAdArt(url) {
@@ -821,24 +922,68 @@ function setAdArt(url) {
   el.innerHTML = `<img src="${url}" alt="">`; el.classList.add("has");
 }
 // 현재 앨범 상세의 곡들을 큐로 만들어 재생(전체/셔플, 또는 특정 곡부터).
-function albumQueueIdxs() {
-  return [...$("#track-list").querySelectorAll(".ad-tracks .track")]
-    .map((r) => library.findIndex((t) => t.id === r.dataset.id)).filter((i) => i >= 0);
+function albumQueueIds() {
+  return [...$("#track-list").querySelectorAll(".ad-tracks .track")].map((r) => r.dataset.id);
 }
 function albumPlay(shuffleIt) {
-  const idxs = albumQueueIdxs();
-  if (!idxs.length) return toast("재생할 수 있는 곡이 없습니다.");
-  if (shuffleIt) for (let i = idxs.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [idxs[i], idxs[j]] = [idxs[j], idxs[i]]; }
-  plQueue = idxs; plQueuePos = 0; playByLibIndex(idxs[0]); openPlayer();
+  const first = setQueue(albumQueueIds(), null, shuffleIt || undefined);
+  if (!first) return toast("재생할 수 있는 곡이 없습니다.");
+  playId(first); openPlayer();
 }
 function albumPlayFrom(id) {
-  const ids = [...$("#track-list").querySelectorAll(".ad-tracks .track")].map((r) => r.dataset.id);
-  const idxs = ids.map((x) => library.findIndex((t) => t.id === x)).filter((i) => i >= 0);
-  const pos = ids.indexOf(id); if (pos < 0 || !idxs.length) return;
-  let qpos = 0; for (let i = 0; i < pos; i++) if (library.findIndex((t) => t.id === ids[i]) >= 0) qpos++;
-  plQueue = idxs; plQueuePos = Math.min(qpos, idxs.length - 1);
-  playByLibIndex(plQueue[plQueuePos]); openPlayer();
+  const first = setQueue(albumQueueIds(), id);
+  if (first) { playId(first); openPlayer(); }
 }
+
+/* ───────────────────── 재생 대기열 ───────────────────── */
+function rebuildIdIndex() {
+  idIndex = new Map();
+  library.forEach((t, i) => idIndex.set(t.id, i));
+  curIndex = curId != null && idIndex.has(curId) ? idIndex.get(curId) : -1;
+}
+const libIdx = (id) => (id != null && idIndex.has(id)) ? idIndex.get(id) : -1;
+// 0..n-1 을 섞는다. first(>=0) 는 맨 앞에 둔다(지금 고른 곡부터 셔플).
+function shuffledRange(n, first) {
+  const a = [];
+  for (let i = 0; i < n; i++) if (i !== first) a.push(i);
+  for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+  if (first >= 0) a.unshift(first);
+  return a;
+}
+// 대기열을 새로 세운다. startId 가 있으면 그 곡부터. 반환: 첫 곡 id(없으면 null).
+// forceShuffle: 앨범 '셔플' 버튼처럼 전역 셔플과 무관하게 이번만 섞을 때.
+function setQueue(ids, startId, forceShuffle) {
+  queue = (ids || []).filter((id) => idIndex.has(id));
+  if (!queue.length) { qOrder = []; qPos = -1; return null; }
+  const start = startId != null ? queue.indexOf(startId) : -1;
+  const sh = forceShuffle ?? shuffle;
+  qOrder = sh ? shuffledRange(queue.length, start) : queue.map((_, i) => i);
+  qPos = sh ? 0 : Math.max(0, start);
+  return queue[qOrder[qPos]];
+}
+// 지금 보이는 목록을 대기열로(맥락 없이 재생을 시작할 때 — ▶, 이어듣기).
+function queueFromView(startId) { return setQueue(filtered.map((t) => t.id), startId); }
+// 셔플을 켜고 끌 때: 지금 곡은 그대로 두고 나머지 순서만 바꾼다.
+function reorderQueue() {
+  if (!queue.length) return;
+  const ci = qOrder[qPos] ?? queue.indexOf(curId);
+  qOrder = shuffle ? shuffledRange(queue.length, ci) : queue.map((_, i) => i);
+  qPos = shuffle ? 0 : Math.max(0, ci);
+}
+// qOrder 에서 from 다음(dir=±1)의, 라이브러리에 아직 있는 곡 위치. 없으면 -1.
+function queueStep(from, dir, wrap) {
+  const n = qOrder.length;
+  let p = from;
+  for (let k = 0; k < n; k++) {
+    p += dir;
+    if (p >= n) { if (!wrap) return -1; p = 0; }
+    if (p < 0) { if (!wrap) return -1; p = n - 1; }
+    if (libIdx(queue[qOrder[p]]) >= 0) return p;
+  }
+  return -1;
+}
+function playId(id, opts) { const i = libIdx(id); if (i >= 0) playByLibIndex(i, opts); }
+function saveUpNext() { LS.set("upnext", upNext.slice(0, 200)); }
 
 /* ───────────────────── 재생 ───────────────────── */
 function driveUrl(id) { return `https://www.googleapis.com/drive/v3/files/${id}?alt=media&supportsAllDrives=true`; }
@@ -858,7 +1003,7 @@ function startPlayback(url, crossfade) {
     if (incoming.src !== url) incoming.src = url;
     try { incoming.currentTime = 0; } catch (_) {}
     audio = incoming; spare = outgoing;   // 새 요소를 '활성'으로 → 이벤트가 새 곡에 귀속
-    incoming.play().catch(() => {});
+    safePlay(incoming);
     let t = 0;
     fadeTimer = setInterval(() => {
       t += FADE_STEP_MS;
@@ -873,13 +1018,33 @@ function startPlayback(url, crossfade) {
         schedulePreloadNext();   // 이제 spare가 비었으니 다음 곡을 미리 버퍼
       }
     }, FADE_STEP_MS);
+  } else if (spare.src === url && audio.src !== url && !spare.error) {   // 미리 받다 실패한 요소는 쓰지 않는다
+    // 다음 곡을 대기 요소에 미리 받아 뒀다 → 그 요소로 갈아탄다(버퍼 재사용 = 곡 사이 무음 없음).
+    // 예전엔 대기 요소를 비우고 활성 요소에 처음부터 다시 받아, 크로스페이드를 끄면 곡마다 1~2초 끊겼다.
+    const outgoing = audio;
+    audio = spare; spare = outgoing;
+    try { outgoing.pause(); outgoing.removeAttribute("src"); outgoing.load(); outgoing.volume = 1; } catch (_) {}
+    try { audio.volume = 1; audio.currentTime = 0; } catch (_) {}
+    safePlay(audio);
+    schedulePreloadNext();
   } else {
     try { spare.pause(); if (spare.src !== url) spare.removeAttribute("src"); } catch (_) {}
     try { audio.volume = 1; } catch (_) {}
     if (audio.src !== url) audio.src = url;
-    audio.play().catch(() => {});
+    safePlay(audio);
     schedulePreloadNext();
   }
+}
+// play() 거절 처리 — 자동재생 차단(NotAllowedError)이면 ▶ 로 되돌려 사용자가 누르게 한다.
+// AbortError(그새 src 가 바뀜)는 정상. 스트림 오류는 'error' 이벤트(onStreamError)가 맡는다.
+function safePlay(el) {
+  const p = el.play();
+  if (p && p.catch) p.catch((e) => { if (e && e.name === "NotAllowedError" && el === audio) setPlayIcons(false); });
+  return p;
+}
+function setPlayIcons(state) {   // true=재생 중, false=멈춤, "wait"=불러오는 중
+  const s = state === "wait" ? "…" : state ? "❚❚" : "▶";
+  $("#mini-play").textContent = s; $("#btn-play").textContent = s;
 }
 
 // ── 다음 곡 미리 버퍼링(순차 재생일 때만) ──────────────────────────────
@@ -887,17 +1052,12 @@ function startPlayback(url, crossfade) {
 // Drive 첫 바이트 지연이 보인다. 다음 곡을 대기(spare) 요소에 미리 올려 브라우저가
 // 앞부분을 버퍼링해 두면, 넘길 때 곧바로 소리가 난다. 셔플·마지막 곡(반복 아님)이면
 // 예측이 안 되거나 다음이 없어 건너뛴다. 데이터는 다음 1곡분만 더 쓴다.
+// 셔플도 순서(qOrder)가 미리 정해져 있어 예측된다 → 셔플에서도 미리 받는다(예전엔 셔플이면 곡마다 끊김).
 function peekNextIndex() {
-  if (shuffle) return -1;
-  if (plQueue && plQueue.length) {
-    let p = plQueuePos + 1;
-    if (p >= plQueue.length) { if (repeat !== "all") return -1; p = 0; }
-    return plQueue[p];
-  }
-  if (!library.length) return -1;
-  let n = curIndex + 1;
-  if (n >= library.length) { if (repeat !== "all") return -1; n = 0; }
-  return n;
+  for (const id of upNext) { const i = libIdx(id); if (i >= 0) return i; }
+  if (repeat === "one") return -1;
+  const p = queueStep(qPos, +1, repeat === "all");
+  return p < 0 ? -1 : libIdx(queue[qOrder[p]]);
 }
 let preloadTimer = null;
 function schedulePreloadNext() {
@@ -929,7 +1089,7 @@ function preloadNext() {
 // 그래프: source → spComp(음량 평준화 컴프) → spMakeup → [spDry(통과) + spPre→spConv→spWet(리버브)] → 출력
 // 공간감(리버브)과 음량 평준화(컴프레션)를 한 체인에서 각각 켜고 끈다. 둘 다 꺼져 있으면
 // 그래프를 아예 만들지 않아 기존 재생 경로를 안 건드린다.
-let actx = null, spDry = null, spWet = null, spConv = null, spPre = null, spComp = null, spMakeup = null;
+let actx = null, spDry = null, spWet = null, spConv = null, spPre = null, spComp = null, spMakeup = null, spLimit = null;
 let spaceReady = false, spaceApplied = false, normApplied = false;
 let curSpaceMode = "off";   // 현재 공간감 모드 — 일시정지 때 잔향을 껐다가 재생 때 되살리기 위함
 const spaceSources = new WeakMap();
@@ -982,12 +1142,21 @@ function ensureSpaceGraph() {
     for (const b of eqBands) { prev.connect(b); prev = b; }
     prev.connect(spDry); prev.connect(spPre);
     spPre.connect(spConv); spConv.connect(spWet);
-    spDry.connect(actx.destination); spWet.connect(actx.destination);
+    // 마지막에 리미터 — EQ 를 크게 올려도 0dBFS 를 넘겨 찢어지지 않게(평소엔 거의 손대지 않음)
+    spLimit = actx.createDynamicsCompressor();
+    spLimit.threshold.value = -1; spLimit.knee.value = 0; spLimit.ratio.value = 20;
+    spLimit.attack.value = 0.002; spLimit.release.value = 0.12;
+    spDry.connect(spLimit); spWet.connect(spLimit); spLimit.connect(actx.destination);
+    // 전화·알림·블루투스 전환으로 그래프가 멈추면(재생 표시인데 무음) 재생 중일 때 바로 되살린다
+    actx.onstatechange = () => { if (actx.state !== "running" && !audio.paused) resumeAudioGraph(); };
     routeSpace(audio); routeSpace(spare);
     spaceReady = true;
     applyEq();                    // 저장된 EQ 설정을 실제 노드에 반영
     return true;
   } catch (_) { spaceReady = false; return false; }
+}
+function resumeAudioGraph() {
+  if (actx && actx.state !== "running" && actx.state !== "closed") actx.resume().catch(() => {});
 }
 function reflectSpaceUI(mode) {
   // 공간감 버튼(off/soft/wide)만 토글한다. 같은 줄의 '평준화'(#fx-norm)는
@@ -1205,11 +1374,12 @@ function restoreResume() {
   if (curIndex >= 0) return;                 // 이미 재생/복원됨
   const r = LS.get("resume", null); if (!r || !r.rel) return;
   const t = trackByRel(r.rel); if (!t) return;
-  const idx = library.findIndex((x) => x.id === t.id); if (idx < 0) return;
-  curIndex = idx; resumeTrackId = t.id; pendingSeek = r.pos || 0;
+  const idx = libIdx(t.id); if (idx < 0) return;
+  curIndex = idx; curId = t.id; resumeTrackId = t.id; pendingSeek = r.pos || 0;
+  queueFromView(t.id);                       // 이어서 ⏭ 하면 보이는 목록의 다음 곡
   $("#mini").hidden = false;
   setNowPlaying({ title: t.title, artist: t.artist, album: t.album || "", year: t.year, genre: t.genre, cover: null });
-  $("#mini-play").textContent = "▶"; $("#btn-play").textContent = "▶";
+  setPlayIcons(false);
   updateMediaSession(t.title, t.artist, t.album || "", null);
   getCachedCover(t).then((url) => {
     if (!url || curIndex !== idx) { url && URL.revokeObjectURL(url); return; }
@@ -1253,11 +1423,19 @@ function renderStats() {
 }
 
 async function playByLibIndex(i, opts = {}) {
-  if (i < 0 || i >= library.length) return;
-  advancing = false;                 // 자동 크로스페이드 예약 해제(새 곡 시작)
+  if (!(i >= 0 && i < library.length)) return;   // undefined·NaN 도 걸러낸다
+  // ‼ advancing(곡 끝 자동 넘김 중)은 여기서 풀지 않는다 — 토큰을 받는 동안(최대 수 초) 옛 곡의
+  //   timeupdate·ended 가 다음 곡을 또 불러 여러 곡을 건너뛰었다. 새 곡이 실제로 붙은 뒤에 푼다.
+  const gen = ++playGen;
   // 이어듣기: 복원된 그 곡을 시작할 때만 저장 위치로 시크한다. 다른 곡을 고르면 시크 취소.
   if (resumeTrackId) { if (!(library[i] && library[i].id === resumeTrackId)) pendingSeek = null; resumeTrackId = null; }
   curIndex = i;
+  curId = library[i].id;
+  // 대기열 밖에서 고른 곡(재생큐 등)이 아니면 대기열 위치를 이 곡에 맞춘다.
+  if (queue.length && queue[qOrder[qPos]] !== curId) {
+    const qi = queue.indexOf(curId), op = qi >= 0 ? qOrder.indexOf(qi) : -1;
+    if (op >= 0) qPos = op;
+  }
   // 저장된 공간감·음량 평준화 설정을 첫 재생(=사용자 제스처) 때 한 번 실제로 건다.
   if (!spaceApplied) { spaceApplied = true; const m = LS.get("space_fx", "off"); if (m !== "off") applySpace(m, false); }
   if (!normApplied) { normApplied = true; if (LS.get("norm_fx", "")) applyNormalize(true, false); }
@@ -1279,7 +1457,7 @@ async function playByLibIndex(i, opts = {}) {
   });
   updateMediaSession(known ? track.title : (track.title || ""),
                      known ? track.artist : "", known ? (track.album || "") : "", null);
-  $("#mini-play").textContent = "…"; $("#btn-play").textContent = "…";
+  setPlayIcons("wait");
   lyrics = null; curLyricLine = -1;
   refresh();
   $("#lyrics").innerHTML = `<div class="spinner"></div>`;
@@ -1306,18 +1484,21 @@ async function playByLibIndex(i, opts = {}) {
 
   try {
     await ensureToken();
+    if (gen !== playGen) return;   // 토큰을 받는 사이 다른 곡이 골라졌다 — 옛 요청은 붙이지 않는다
     sendTokenToSW();   // <audio> 요청 전에 SW가 토큰을 갖고 있도록
     // 스트리밍 재생 — SW가 Authorization을 주입하므로 Drive URL을 직접 <audio>에.
     if (curObjectUrl) { URL.revokeObjectURL(curObjectUrl); curObjectUrl = null; }
     startPlayback(driveUrl(track.id), opts.crossfade !== false);
+    advancing = false;             // 새 곡이 붙었다 — 이제 다음 곡 끝에서 다시 넘길 수 있다
     // 메타/커버/가사 — 태그만 '딱 필요한 만큼' 받아 파싱(1MB 고정 아님).
     const buf = await fetchTagExact(track.id);
-    if (i !== curIndex) return;   // 그새 다른 곡으로 넘어갔으면 무시
+    if (gen !== playGen) return;   // 그새 다른 곡으로 넘어갔으면 무시
     if (buf) {
       const m = parseID3(buf);
       const title = m.title || track.title, artist = m.artist || track.artist;
       track.title = title; track.artist = artist;
       track.album = m.album || ""; track.year = m.year || ""; track.genre = m.genre || "";
+      track.track = m.track || 0; track.albumArtist = m.albumArtist || "";
       track.enriched = true;
       persistLibrary();               // 읽은 태그를 캐시에 저장(다음엔 앨범/정렬에 바로 반영)
       // Drive 썸네일이 이미 커버를 띄웠으면 임베디드는 건드리지 않는다(썸네일 유지·중복 방지).
@@ -1333,11 +1514,13 @@ async function playByLibIndex(i, opts = {}) {
       updateMediaSession(title, artist, m.album, curCoverUrl);
       refresh();
       // 순차 재생이면 '다음 여러 곡' 커버를 미리 받아둔다(스킵 시 즉시 표시). 셔플은 예측 불가라 생략.
-      if (!shuffle && i === curIndex) prefetchCoversAhead(i, 4);
+      prefetchCoversAhead(i, 4);
     }
   } catch (e) {
+    if (gen !== playGen) return;
+    advancing = false;
     toast("재생 실패: " + e.message);
-    $("#mini-play").textContent = "▶"; $("#btn-play").textContent = "▶";
+    setPlayIcons(false);
   }
 }
 function setNowPlaying({ title, artist, album, year, genre, cover }) {
@@ -1401,42 +1584,38 @@ function syncLyrics() {
 function nextTrack(auto) {
   // 슬립 타이머 '이 곡 끝나면': 자동 넘김 시점에 다음 곡으로 가지 않고 정지한다.
   if (auto && sleepAfterTrack) { sleepAfterTrack = false; reflectSleep(); stopPlayback(); return; }
-  if (repeat === "one" && auto) { audio.currentTime = 0; audio.play(); return; }
-  // 사용자 지정 재생큐(다음에 재생/큐에 추가)를 가장 먼저 소비한다. 플레이리스트 재생
-  // 중이면 그 곡을 '끼워' 재생하고, 큐가 비면 원래 플레이리스트가 이어진다(plQueue 유지).
+  if (repeat === "one" && auto) { audio.currentTime = 0; safePlay(audio); return; }
+  // 사용자 지정 재생큐(다음에 재생/큐에 추가)를 가장 먼저 소비한다. 대기열 위치(qPos)는
+  // 그대로 두므로, 재생큐가 비면 원래 목록·플레이리스트가 이어진다.
   while (upNext.length) {
     const id = upNext.shift();
-    const idx = library.findIndex((t) => t.id === id);
-    if (idx >= 0) { reflectUpNext(); playByLibIndex(idx); return; }
+    if (libIdx(id) >= 0) { saveUpNext(); reflectUpNext(); playId(id); return; }
   }
-  reflectUpNext();
-  // 플레이리스트 재생 중이면 그 큐 안에서 다음 곡으로.
-  if (plQueue && plQueue.length) {
-    let p;
-    if (shuffle) { do { p = Math.floor(Math.random() * plQueue.length); } while (plQueue.length > 1 && p === plQueuePos); }
-    else { p = plQueuePos + 1; if (p >= plQueue.length) { if (repeat !== "all" && auto) return; p = 0; } }
-    plQueuePos = p; playByLibIndex(plQueue[p]); return;
-  }
-  if (!library.length) return;
-  let n;
-  if (shuffle) { do { n = Math.floor(Math.random() * library.length); } while (library.length > 1 && n === curIndex); }
-  else { n = curIndex + 1; if (n >= library.length) { if (repeat !== "all" && auto) return; n = 0; } }
-  playByLibIndex(n);
+  saveUpNext(); reflectUpNext();
+  if (!queue.length) { const first = queueFromView(curId); if (!first) return; }
+  // 자동 넘김은 반복이 꺼져 있으면 끝에서 멈추고, 버튼(⏭)은 처음으로 돈다.
+  const p = queueStep(qPos, +1, repeat === "all" || !auto);
+  if (p < 0) return;
+  qPos = p; playId(queue[qOrder[p]]);
 }
+// 이전 곡: qOrder 한 칸 뒤 = 셔플이어도 '직전에 들은 곡'(예전엔 라이브러리 배열의 앞 곡).
 function prevTrack() {
   if (audio.currentTime > 3) { audio.currentTime = 0; return; }
-  if (plQueue && plQueue.length) {
-    let p = plQueuePos - 1; if (p < 0) p = plQueue.length - 1;
-    plQueuePos = p; playByLibIndex(plQueue[p]); return;
-  }
-  let n = curIndex - 1; if (n < 0) n = library.length - 1;
-  playByLibIndex(n);
+  if (!queue.length && !queueFromView(curId)) return;
+  const p = queueStep(qPos, -1, true);
+  if (p < 0) return;
+  qPos = p; playId(queue[qOrder[p]]);
 }
 function togglePlay() {
-  if (curIndex < 0 && library.length) return playByLibIndex(0);
-  // 이어듣기로 곡만 복원된 상태(아직 스트림을 안 붙임) → 저장 위치부터 실제 재생 시작.
-  if (!audio.src) { if (curIndex >= 0) playByLibIndex(curIndex); return; }
-  if (audio.paused) { audio.play(); return; }
+  // 재생 중인 스트림이 있으면 그것만 켜고 끈다(곡이 목록에서 사라졌어도).
+  if (!audio.src) {
+    // 이어듣기로 곡만 복원된 상태(아직 스트림을 안 붙임) → 저장 위치부터 실제 재생 시작.
+    if (curIndex >= 0) { if (!queue.length) queueFromView(curId); playByLibIndex(curIndex); return; }
+    const first = queueFromView(null);
+    if (first) playId(first);
+    return;
+  }
+  if (audio.paused) { resumeAudioGraph(); safePlay(audio); return; }
   // 페이드 도중 일시정지: 페이드를 즉시 끝내고(활성 요소만 남김) 멈춘다.
   if (fadeTimer) { clearFade(); try { spare.pause(); spare.removeAttribute("src"); audio.volume = 1; } catch (_) {} }
   audio.pause();
@@ -1466,14 +1645,17 @@ function updateMediaSession(title, artist, album, cover) {
     });
   } catch (_) {}
   const set = (a, fn) => { try { navigator.mediaSession.setActionHandler(a, fn); } catch (_) {} };
-  set("play", () => { if (!audio.src && curIndex >= 0) playByLibIndex(curIndex); else audio.play(); });
+  set("play", () => { if (!audio.src) togglePlay(); else { resumeAudioGraph(); safePlay(audio); } });
   set("pause", () => audio.pause());
   set("previoustrack", prevTrack);
   set("nexttrack", () => nextTrack(false));
   set("stop", stopPlayback);   // 미디어 알림을 밀어 없애면 재생 중단
   set("seekbackward", (d) => { audio.currentTime = Math.max(0, audio.currentTime - (d.seekOffset || 10)); });
   set("seekforward", (d) => { audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + (d.seekOffset || 10)); });
-  set("seekto", (d) => { if (d.seekTime != null && audio.duration) audio.currentTime = d.seekTime; });
+  set("seekto", (d) => {
+    if (d.seekTime == null || !audio.duration) return;
+    if (d.fastSeek && audio.fastSeek) audio.fastSeek(d.seekTime); else audio.currentTime = d.seekTime;
+  });
 }
 // 잠금화면 진행바용 위치 상태(간헐 갱신). duration이 유효할 때만.
 function updatePositionState() {
@@ -1864,6 +2046,7 @@ async function onSettingsAction(act) {
     if (!fp.length) return toast("폴더를 한 줄 이상 적어 주세요.");
     setFolderPaths(fp);
     plParentId = null; plFileId = null; LS.set("pl_parent", null);   // 첫 폴더가 바뀌면 공유 파일 위치도 바뀐다
+    coverMap = null; coverFolderId = null; indexFileId = null;        // 공유 커버(_covers)도 새 폴더 기준으로
     $("#set-folders").blur();
     toast("폴더를 저장했습니다. 곡 목록을 다시 읽습니다.");
     loadLibrary(true);
@@ -1921,13 +2104,16 @@ function plCoverUrl(pl, cb) {
   if (custom) return cb(custom);
   const first = pl.rel.length ? trackByRel(pl.rel[0]) : null;
   if (!first) return cb(null);
-  getCachedCover(first).then((url) => {
+  getSharedCover(first).then((url) => {
     if (url) return cb(url);
-    prefetchCover(first).then(() => getCachedCover(first).then((u) => cb(u || null)));   // 없으면 받아 캐시 후 갱신
+    prefetchCover(first).then(() => getSharedCover(first).then((u) => cb(u || null)));   // 없으면 받아 캐시 후 갱신
   });
 }
 
+let plRenderPending = false;
 function renderPlaylists() {
+  // 끌어서 순서를 바꾸는 중에 동기화가 목록을 다시 그리면, 놓을 때 엉뚱한 순서로 들어갔다 — 놓은 뒤로 미룬다
+  if (pldDrag) { plRenderPending = true; return; }
   const box = $("#pl-list");
   const head = $(".pl-head");
   if (selectedPlaylistId) { if (head) head.hidden = true; box.classList.add("detail"); return renderPlaylistDetail(box); }
@@ -2030,6 +2216,7 @@ function pldGripMove(e) {
 function pldGripUp() {
   const d = pldDrag; if (!d) return;
   pldDrag = null;
+  if (plRenderPending) { plRenderPending = false; setTimeout(renderPlaylists, 0); }
   document.removeEventListener("pointermove", pldGripMove);
   document.removeEventListener("pointerup", pldGripUp);
   document.removeEventListener("pointercancel", pldGripUp);
@@ -2100,15 +2287,16 @@ function queueAddTrack(track, front) {
   const i = upNext.indexOf(track.id);
   if (i >= 0) upNext.splice(i, 1);            // 중복 제거
   if (front) upNext.unshift(track.id); else upNext.push(track.id);
+  saveUpNext(); schedulePreloadNext();
   reflectUpNext();
   toast(front ? "다음에 재생합니다." : "큐에 추가했어요.");
 }
 function removeUpNextAt(pos) {
   if (pos < 0 || pos >= upNext.length) return;
-  upNext.splice(pos, 1);
+  upNext.splice(pos, 1); saveUpNext();
   reflectUpNext(); renderUpNext();
 }
-function clearUpNext() { upNext = []; reflectUpNext(); renderUpNext(); }
+function clearUpNext() { upNext = []; saveUpNext(); reflectUpNext(); renderUpNext(); }
 // 플레이어의 '다음 곡 N' 칩 표시 갱신.
 function reflectUpNext() {
   const chip = $("#upnext-chip");
@@ -2155,18 +2343,17 @@ function playlistIndices(pl) {
   return out;
 }
 function playPlaylistFrom(pl, startRelPos) {
-  const idxs = playlistIndices(pl);
-  if (!idxs.length) return toast("재생할 수 있는 곡이 없습니다(라이브러리 새로고침 필요).");
-  let qpos = 0;
-  if (startRelPos != null) {   // rel 인덱스 → 큐(라이브러리에 있는 곡만) 위치로 환산
-    for (let i = 0; i < startRelPos && i < pl.rel.length; i++) {
-      const id = relToId.get(pl.rel[i]);
-      if (id && library.some((t) => t.id === id)) qpos++;
+  const ids = pl.rel.map((rel) => relToId.get(rel)).filter((id) => id && idIndex.has(id));
+  if (!ids.length) return toast("재생할 수 있는 곡이 없습니다(라이브러리 새로고침 필요).");
+  // 누른 줄(rel 위치)부터 — 그 곡이 라이브러리에 없으면 다음 줄의 곡부터
+  let startId = null;
+  if (startRelPos != null) {
+    for (let i = startRelPos; i < pl.rel.length && !startId; i++) {
+      const id = relToId.get(pl.rel[i]); if (id && idIndex.has(id)) startId = id;
     }
-    if (qpos >= idxs.length) qpos = 0;
   }
-  plQueue = idxs; plQueuePos = qpos;
-  playByLibIndex(plQueue[plQueuePos]);
+  const first = setQueue(ids, startId);
+  if (first) playId(first);
 }
 function playPlaylist(id) {
   const pl = playlists.find((p) => p.id === id);
@@ -2287,15 +2474,24 @@ function switchTab(tab) {
 /* ───────────────────── 태그 캐시 / 읽기 ───────────────────── */
 // 캐시 버전 — toTrack 추정 방향을 고쳐서, 옛 캐시(제목·아티스트가 뒤바뀐)를 자동 폐기한다.
 const LIB_CACHE_VER = 2;
-function saveLibCache() { try { LS.set("lib_cache", { v: LIB_CACHE_VER, tracks: library }); } catch (_) {} }
+// 검색용 임시 필드(_sk·_sn)는 저장하지 않는다 — 캐시가 두 배로 커진다
+function saveLibCache() {
+  try { LS.set("lib_cache", { v: LIB_CACHE_VER, tracks: library.map(({ _sk, _sn, ...t }) => t) }); } catch (_) {}
+}
 function readLibCache() {
   const c = LS.get("lib_cache", null);
   return (c && c.v === LIB_CACHE_VER && Array.isArray(c.tracks)) ? c.tracks : null;
 }
 let saveTimer = null;
+// 묶어서 저장하되 최대 5초는 넘기지 않는다 — 예전엔 태그를 읽을 때마다 타이머를 다시 걸어
+// 대기열이 다 끝날 때까지 한 번도 저장되지 않았고, 도중에 앱이 꺼지면 읽은 것이 전부 날아갔다.
+let saveFirstAt = 0;
 function persistLibrary() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(saveLibCache, 600);
+  const now = Date.now();
+  if (!saveFirstAt) saveFirstAt = now;
+  const wait = Math.max(0, Math.min(600, saveFirstAt + 5000 - now));
+  saveTimer = setTimeout(() => { saveFirstAt = 0; saveLibCache(); if (activeTab === "stats") renderStats(); }, wait);
 }
 
 // 화면에 보이는 곡의 실제 태그를 읽어 목록/그리드를 채운다. 파일명 추정은 태그가
@@ -2304,37 +2500,69 @@ function persistLibrary() {
 const enrichPending = new Set();   // 대기/진행 중인 곡 id
 let enrichActive = 0;
 const enrichQueue = [];
-const ENRICH_CONC = 6;   // 동시 태그 읽기 수(브라우저 호스트당 동시 연결 한도 안쪽)
+const ENRICH_CONC = 6;        // 동시 태그 읽기 수(브라우저 호스트당 동시 연결 한도 안쪽)
+const ENRICH_CONC_PLAYING = 2;   // 재생 중엔 스트림과 대역폭을 다투지 않게 줄인다
+let enrichPauseUntil = 0, enrichPauseTimer = null;
+const enrichFails = new Map();   // 곡 id → 실패 횟수(세 번이면 이번 실행에선 포기)
 
-function queueEnrich(t) {
-  if (!t || t.enriched || enrichPending.has(t.id)) return;
+// priority=true(화면에 보이는 줄): 대기열 맨 앞으로 — 예전엔 전 곡 대기열 뒤에 밀려,
+// 스크롤한 곳이 한참 동안 파일명으로만 보였다.
+function queueEnrich(t, priority) {
+  if (!t || t.enriched) return;
+  if (enrichPending.has(t.id)) {
+    if (priority) { const i = enrichQueue.indexOf(t); if (i > 0) { enrichQueue.splice(i, 1); enrichQueue.unshift(t); } }
+    return;
+  }
   enrichPending.add(t.id);
-  enrichQueue.push(t);
+  if (priority) enrichQueue.unshift(t); else enrichQueue.push(t);
   pumpEnrich();
 }
 function pumpEnrich() {
-  while (enrichActive < ENRICH_CONC && enrichQueue.length) {
+  const wait = enrichPauseUntil - Date.now();
+  if (wait > 0) { clearTimeout(enrichPauseTimer); enrichPauseTimer = setTimeout(pumpEnrich, wait); return; }
+  const conc = audio && !audio.paused ? ENRICH_CONC_PLAYING : ENRICH_CONC;
+  while (enrichActive < conc && enrichQueue.length) {
     const t = enrichQueue.shift();
     enrichActive++;
-    enrichOne(t).finally(() => {
-      enrichActive--; enrichPending.delete(t.id); pumpEnrich();
+    enrichOne(t).then((ok) => {
+      enrichActive--; enrichPending.delete(t.id);
+      if (!ok) {
+        const n = (enrichFails.get(t.id) || 0) + 1; enrichFails.set(t.id, n);
+        if (n < 3) queueEnrich(t);   // 뒤로 다시 — 일시 오류면 나중에 된다
+      }
+      pumpEnrich();
     });
   }
 }
+// 태그를 실제로 읽었을 때만 '읽음'으로 저장한다.
+// ‼ 예전엔 요청이 실패(403·429 요청 제한, 5xx, 오프라인)해도 enriched=true 로 영구 저장해,
+//   그 곡들은 앨범·연도·장르가 빈 채로 다시는 읽히지 않았다.
 async function enrichOne(t) {
   try {
-    const buf = await fetchTagBytes(t.id, 32767);   // 32KB — 텍스트 프레임은 대개 태그 앞쪽(커버 앞)
-    if (buf) {
-      const m = parseID3(buf);
-      if (m.title) t.title = m.title;
-      if (m.artist) t.artist = m.artist;
-      t.album = m.album || ""; t.year = m.year || ""; t.genre = m.genre || "";
-      t.guessed = !(m.title || m.artist);   // 태그가 있으면 추정 해제
+    let buf = await fetchTagBytes(t.id, 32767);   // 32KB — 텍스트 프레임은 대개 태그 앞쪽(커버 앞)
+    if (!buf) {
+      if (lastTagStatus === 403 || lastTagStatus === 429 || lastTagStatus >= 500) enrichPauseUntil = Date.now() + 60000;
+      return false;
     }
-  } catch (_) { return; }   // 실패 시 enriched 표시 안 함 → 다음에 다시 시도
+    let m = parseID3(buf);
+    // 태그가 32KB 보다 크고(앞쪽에 큰 커버) 제목을 못 찾았으면 태그 크기만큼 다시(최대 1MB)
+    if (!m.title && !m.artist && m.tagSize > buf.byteLength) {
+      const more = await fetchTagBytes(t.id, Math.min(m.tagSize, 1048576) - 1);
+      if (more) m = parseID3(more);
+    }
+    applyTags(t, m);
+  } catch (_) { return false; }   // 실패 시 enriched 표시 안 함 → 다음에 다시 시도
   t.enriched = true;
   persistLibrary();
   updateRowInPlace(t);
+  return true;
+}
+function applyTags(t, m) {
+  if (m.title) t.title = m.title;
+  if (m.artist) t.artist = m.artist;
+  t.album = m.album || ""; t.year = m.year || ""; t.genre = m.genre || "";
+  t.track = m.track || 0; t.albumArtist = m.albumArtist || "";
+  t.guessed = !(m.title || m.artist);   // 태그가 있으면 추정 해제
 }
 // 로드 후 백그라운드로 '전 곡'의 태그를 미리 읽어 캐시에 채운다. 그러면 다음부턴
 // 목록·재생 정보가 추정값 없이 처음부터 실제 태그로 뜬다(곡당 32KB, 한 번만·영구 캐시).
@@ -2381,16 +2609,13 @@ async function enrichAll() {
   async function worker() {
     while (queue.length && !enrichStop) {
       const t = queue.shift();
+      let ok = false;
       try {
         const buf = await fetchTagBytes(t.id, 98303);   // 96KB — 텍스트 프레임엔 충분
-        if (buf) {
-          const m = parseID3(buf);
-          if (m.title) t.title = m.title;
-          if (m.artist) t.artist = m.artist;
-          t.album = m.album || ""; t.year = m.year || ""; t.genre = m.genre || "";
-        }
+        if (buf) { applyTags(t, parseID3(buf)); ok = true; }
       } catch (_) {}
-      t.enriched = true; done++;
+      if (ok) t.enriched = true;   // 실패한 곡은 '읽음'으로 남기지 않는다(다음에 다시)
+      done++;
       if (done % 10 === 0) { status.textContent = `곡 정보 읽는 중… ${done}/${todo.length} (탭하면 중단)`; persistLibrary(); }
     }
   }
@@ -2411,21 +2636,44 @@ function updateEnrichBtn() {
 }
 
 /* ───────────────────── 라이브러리 로딩 ───────────────────── */
-async function loadLibrary(forceRefresh) {
+const LIB_REVALIDATE_MS = 12 * 3600 * 1000;   // 캐시가 이보다 오래되면 백그라운드로 다시 훑는다
+// 새로 훑은 목록으로 바꾼다. 같은 id·같은 크기의 곡은 읽어 둔 태그를 그대로 잇는다
+// (예전엔 ⟳ 한 번에 태그를 전부 버리고 2,200곡을 다시 읽었다 — 약 70MB).
+// 재생 중인 곡·대기열은 id 로 들고 있으므로 번호가 바뀌어도 그대로 이어진다.
+function replaceLibrary(fresh) {
+  const old = new Map(library.map((t) => [t.id, t]));
+  for (const t of fresh) {
+    const o = old.get(t.id);
+    if (o && o.enriched && o.size === t.size) {
+      for (const k of ["title", "artist", "album", "year", "genre", "track", "albumArtist", "guessed"]) if (k in o) t[k] = o[k];
+      t.enriched = true;
+    }
+  }
+  const gone = library.length - fresh.filter((t) => old.has(t.id)).length;
+  const added = fresh.filter((t) => !old.has(t.id)).length;
+  library = fresh;
+  rebuildIdIndex();
+  return { gone, added };
+}
+async function loadLibrary(forceRefresh, opts = {}) {
   const status = $("#lib-status");
   const cached = readLibCache();
   if (cached && !forceRefresh) {
-    library = cached; applySearch();
+    library = cached; rebuildIdIndex(); applySearch();
     status.textContent = `${library.length}곡 (캐시) · ⟳ 로 새로고침`;
     restoreResume();   // 마지막에 듣던 곡을 미니바에 복원(이어듣기)
     syncPlaylists();   // 라이브러리 준비됨 → 플레이리스트 동기화(rel 매핑 필요)
     enrichAllBg();     // 캐시에 아직 태그 없는 곡이 있으면 백그라운드로 마저 채운다
     setTimeout(probeCoverStore, 800);   // 커버 로딩 방식 진단(한 번)
+    // 캐시가 오래됐으면 조용히 다시 훑는다 — Drive 에서 지우거나 추가한 곡을 ⟳ 없이 반영
+    if (Date.now() - (LS.get("lib_cache_at", 0) || 0) > LIB_REVALIDATE_MS)
+      setTimeout(() => { if (navigator.onLine) loadLibrary(true, { silent: true }); }, 5000);
     return;
   }
   const paths = getFolderPaths();
-  status.textContent = "음악 폴더 찾는 중…";
-  $("#track-list").innerHTML = `<div class="spinner"></div>`;
+  const hadList = library.length > 0;
+  if (!opts.silent) status.textContent = "음악 폴더 찾는 중…";
+  if (!hadList) $("#track-list").innerHTML = `<div class="spinner"></div>`;   // 목록이 있으면 그대로 둔 채 다시 훑는다
   try {
     const rootIds = [], missing = [];
     for (const p of paths) {
@@ -2433,15 +2681,19 @@ async function loadLibrary(forceRefresh) {
       if (id) rootIds.push(id); else missing.push(p);
     }
     if (!rootIds.length) {
+      if (opts.silent) return;
       status.textContent = "";
-      $("#track-list").innerHTML = `<li class="entries-empty">음악 폴더를 찾지 못했습니다:<br>${
-        paths.map(escapeHtml).join("<br>")}<br><br>상단 📁 로 경로를 확인/수정하세요.<br>(My Drive 기준, 예: Junho's Data/취미/음악)</li>`;
+      if (!hadList) $("#track-list").innerHTML = `<li class="entries-empty">음악 폴더를 찾지 못했습니다:<br>${
+        paths.map(escapeHtml).join("<br>")}<br><br>설정 › 음악 폴더에서 경로를 확인/수정하세요.<br>(My Drive 기준, 예: Junho's Data/취미/음악)</li>`;
+      else toast("음악 폴더를 찾지 못했습니다 — 설정 › 음악 폴더를 확인하세요.");
       return;
     }
-    library = await listFolderAudio(rootIds, (n) => (status.textContent = `불러오는 중… ${n}곡`));
-    saveLibCache();
+    const fresh = await listFolderAudio(rootIds, (n) => { if (!opts.silent) status.textContent = `불러오는 중… ${n}곡`; });
+    const diff = replaceLibrary(fresh);
+    saveLibCache(); LS.set("lib_cache_at", Date.now());
     applySearch();
     status.textContent = `${library.length}곡` + (missing.length ? ` · ⚠️ 못 찾은 폴더: ${missing.join(", ")}` : "");
+    if (opts.silent && (diff.added || diff.gone)) toast(`곡 목록 갱신 — 추가 ${diff.added} · 삭제 ${diff.gone}`);
     plParentId = rootIds[0];           // 공용 플레이리스트 파일을 둘 음악 루트 폴더
     LS.set("pl_parent", plParentId);   // 캐시 로드 시 재사용
     restoreResume();                   // 마지막에 듣던 곡을 미니바에 복원(이어듣기)
@@ -2449,8 +2701,10 @@ async function loadLibrary(forceRefresh) {
     enrichAllBg();                     // 전 곡 태그를 백그라운드로 미리 읽어 캐시(처음부터 실제 태그)
     setTimeout(probeCoverStore, 800);   // 커버 로딩 방식 진단(한 번)
   } catch (e) {
-    status.textContent = "";
-    $("#track-list").innerHTML = `<li class="entries-empty">목록 로딩 실패: ${escapeHtml(e.message)}</li>`;
+    // 실패해도 보던 목록은 지우지 않는다(예전엔 오프라인에서 ⟳ 하면 목록이 사라졌다)
+    if (opts.silent) return;
+    if (hadList) { status.textContent = `${library.length}곡 · 새로고침 실패: ${e.message}`; render(); }
+    else { status.textContent = ""; $("#track-list").innerHTML = `<li class="entries-empty">목록 로딩 실패: ${escapeHtml(e.message)}</li>`; }
   }
 }
 // (음악 폴더 편집은 설정 탭의 '음악 폴더' 카드로 옮겼다 — onSettingsAction("folders"))
@@ -2498,7 +2752,13 @@ function signOut() {
 }
 
 /* ───────────────────── 이벤트 바인딩 ───────────────────── */
+// 아이콘만 있는 버튼에 화면 낭독기용 이름(TalkBack)
+const ARIA = { "btn-refresh": "곡 목록 새로고침", "mini-play": "재생/일시정지", "mini-next": "다음 곡",
+  "player-close": "재생 화면 닫기", "player-add": "플레이리스트에 담기", "btn-shuffle": "셔플",
+  "btn-prev": "이전 곡", "btn-play": "재생/일시정지", "btn-next": "다음 곡", "btn-repeat": "반복",
+  "plp-close": "곡 추가 닫기", "btn-pl-refresh": "PC 변경 내용 불러오기" };
 function bind() {
+  for (const [id, label] of Object.entries(ARIA)) $("#" + id)?.setAttribute("aria-label", label);
   $$(".ver").forEach((el) => (el.textContent = APP_VERSION));
   $("#client-id").value = CLIENT_ID;
   $("#folder-paths").value = getFolderPaths().join("\n");
@@ -2516,7 +2776,9 @@ function bind() {
   });
   $("#btn-refresh").addEventListener("click", () => loadLibrary(true));
   bindSettings();   // 폴더·로그아웃은 설정 탭으로 옮겼다
-  $("#search").addEventListener("input", applySearch);
+  // 글자를 칠 때마다 전 곡을 다시 거르지 않게 잠깐 묶는다
+  let searchT = null;
+  $("#search").addEventListener("input", () => { clearTimeout(searchT); searchT = setTimeout(applySearch, 120); });
 
   // 정렬 / 보기 전환 / 곡 정보 읽기
   const sortSel = $("#sort-mode");
@@ -2550,8 +2812,9 @@ function bind() {
     const card = e.target.closest(".album-card");
     if (card) { selectedAlbum = card.dataset.album; renderAlbums(); return; }
     const li = e.target.closest(".track"); if (!li) return;
-    plQueue = null;
-    playByLibIndex(library.findIndex((t) => t.id === li.dataset.id));
+    // 지금 보이는 목록(검색·정렬 그대로)을 대기열로 — 다음 곡이 화면의 다음 줄이 된다
+    const first = queueFromView(li.dataset.id);
+    if (first) playId(first);
     openPlayer();
   });
 
@@ -2560,8 +2823,8 @@ function bind() {
 
   // 플레이리스트
   $("#btn-pl-new").addEventListener("click", () => {
-    const name = prompt("새 플레이리스트 이름"); if (!name) return;
-    playlists.push({ id: Date.now().toString(36), name: name.trim(), rel: [], ts: Date.now() });
+    const name = (prompt("새 플레이리스트 이름") || "").trim(); if (!name) return;   // 공백만 넣으면 이름 없는 목록이 생겼다
+    playlists.push({ id: Date.now().toString(36), name, rel: [], ts: Date.now() });
     savePlaylists(); renderPlaylists();
   });
   $("#btn-pl-refresh").addEventListener("click", refreshPlaylists);
@@ -2683,6 +2946,7 @@ function bind() {
   $("#btn-shuffle").addEventListener("click", (e) => {
     shuffle = !shuffle; LS.set("shuffle", shuffle);
     e.currentTarget.classList.toggle("dim", !shuffle);
+    reorderQueue(); schedulePreloadNext();   // 지금 곡은 그대로, 다음 곡부터 섞거나 원래 순서로
   });
   $("#btn-repeat").addEventListener("click", (e) => {
     repeat = repeat === "off" ? "all" : repeat === "all" ? "one" : "off";
@@ -2756,10 +3020,49 @@ function bind() {
   bindAudioEvents(spare);
 }
 
+/* ── 스트림 오류 복구 ──
+   예전엔 <audio> 에 오류 처리가 없어, 지하철처럼 연결이 끊기거나 Drive 가 잠깐 막히면 ‘…’ 에서
+   영영 멈췄다. 이제: 같은 위치에서 두 번까지 다시 받고(토큰도 새로) → 오프라인이면 연결이 돌아올
+   때 이어서 → 그래도 안 되면 다음 곡으로. 연속 3곡 실패면 멈추고 알린다(무한 건너뛰기 방지). */
+let errRetry = { id: null, n: 0, okAt: 0 }, errSkips = 0, onlineResume = null;
+async function onStreamError() {
+  const id = curId; if (!id) return;
+  const pos = audio.currentTime || 0;
+  // 새 곡이거나, 다시 받은 뒤 20초 넘게 잘 나왔으면 재시도 횟수를 새로 센다(긴 곡의 끊김 여러 번)
+  if (errRetry.id !== id || (errRetry.okAt && Date.now() - errRetry.okAt > 20000)) errRetry = { id, n: 0, okAt: 0 };
+  if (!navigator.onLine) {
+    setPlayIcons(false);
+    toast("인터넷이 끊겼습니다 — 연결되면 이어서 재생합니다.");
+    if (onlineResume) window.removeEventListener("online", onlineResume);
+    onlineResume = () => { onlineResume = null; if (curId === id) { errRetry.n = 0; reloadStream(id, pos); } };
+    window.addEventListener("online", onlineResume, { once: true });
+    return;
+  }
+  if (errRetry.n < 2) {
+    errRetry.n++;
+    setPlayIcons("wait");
+    try { if (brokerCfg()) { brokerTok = ""; brokerExp = 0; } await ensureToken(); sendTokenToSW(); } catch (_) {}
+    await new Promise((r) => setTimeout(r, 700 * errRetry.n));
+    if (curId === id) reloadStream(id, pos);
+    return;
+  }
+  errSkips++;
+  if (errSkips > 3) { errSkips = 0; setPlayIcons(false); toast("여러 곡을 연달아 재생하지 못했습니다 — 연결을 확인하세요."); return; }
+  toast("이 곡을 재생하지 못했습니다 — 다음 곡으로 넘어갑니다.");
+  advancing = false;
+  nextTrack(true);
+}
+function reloadStream(id, pos) {
+  pendingSeek = pos > 1 ? pos : null;          // loadedmetadata 에서 그 위치로
+  try { audio.src = driveUrl(id); } catch (_) {}
+  safePlay(audio);
+}
+
 function bindAudioEvents(el) {
   el.addEventListener("play", function () {
     if (this !== audio) return;
-    $("#mini-play").textContent = "❚❚"; $("#btn-play").textContent = "❚❚";
+    setPlayIcons(true);
+    resumeAudioGraph();  // 전화·알림으로 멈춘 효과 그래프를 되살림(안 그러면 재생 표시인데 무음)
     if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
     updatePositionState();
     acquireWakeLock();   // 재생 시작(사용자 제스처)마다 화면 꺼짐 방지 락 재확보
@@ -2767,12 +3070,20 @@ function bindAudioEvents(el) {
   });
   el.addEventListener("pause", function () {
     if (this !== audio) return;
-    $("#mini-play").textContent = "▶"; $("#btn-play").textContent = "▶";
+    setPlayIcons(false);
     if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
     killReverbTail();    // 멈추면 울림 꼬리가 계속 울리지 않게 즉시 끊음
     saveResume(true);    // 멈춘 위치를 이어듣기용으로 저장
   });
-  el.addEventListener("ended", function () { if (this === audio) nextTrack(true); });
+  // advancing 이면 이미 다음 곡으로 넘어가는 중(크로스페이드) — 또 넘기면 한 곡을 건너뛴다
+  el.addEventListener("ended", function () { if (this === audio && !advancing) nextTrack(true); });
+  // 버퍼링 중(…)과 실제 소리가 나는 순간(❚❚)을 구분해 보여 준다 — 지하철에서 '멈춘 건지 받는 중인지'
+  el.addEventListener("waiting", function () { if (this === audio && !this.paused) setPlayIcons("wait"); });
+  el.addEventListener("playing", function () { if (this === audio) { setPlayIcons(true); errSkips = 0; errRetry.okAt = Date.now(); } });
+  el.addEventListener("error", function () { if (this === audio && this.getAttribute("src")) onStreamError(); });
+  // 잠금화면 진행바는 위치가 튈 때 바로 맞춘다(예전엔 최대 2초 늦게 따라왔다)
+  for (const ev of ["seeked", "durationchange", "ratechange"])
+    el.addEventListener(ev, function () { if (this === audio) updatePositionState(); });
   el.addEventListener("loadedmetadata", function () {
     if (this !== audio) return;
     // 이어듣기 복원: 첫 재생 시 저장해 둔 위치로 한 번 시크한다.
@@ -2789,7 +3100,8 @@ function bindAudioEvents(el) {
     if (++posTick % 8 === 0) { updatePositionState(); saveResume(false); }   // 약 2초마다 진행바·이어듣기 갱신
     // 곡 끝 CROSSFADE_MS 전에 다음 곡으로 미리 넘어가 겹치게 한다(AIMP식).
     // 볼륨 조절이 되는 기기에서만(iOS는 즉시 전환). repeat one은 제외.
-    if (crossfadeOK && crossfadeOn && !advancing && repeat !== "one" && d && c > 1
+    // '이 곡 끝나면 정지'면 미리 넘기지 않는다 — 넘기면 마지막 0.8초를 자르고 멈췄다
+    if (crossfadeOK && crossfadeOn && !advancing && !sleepAfterTrack && repeat !== "one" && d && c > 1
         && (d - c) <= CROSSFADE_MS / 1000) {
       advancing = true;
       nextTrack(true);
@@ -2816,6 +3128,8 @@ function takeBrokerLink() {
 }
 
 async function main() {
+  // 커버·셸 캐시를 브라우저가 공간 부족 때 임의로 지우지 않도록 요청(설치형 PWA 는 대개 허용)
+  try { navigator.storage?.persist?.(); } catch (_) {}
   const linked = takeBrokerLink();
   bind();
   if (linked === "ok") toast("토큰 중계를 설정했습니다 — 1시간 제한 없이 재생됩니다.");
@@ -2829,9 +3143,21 @@ async function main() {
     navigator.serviceWorker.register("./sw.js", { updateViaCache: "none" })
       .then((reg) => { try { reg.update(); } catch (_) {} }).catch(() => {});
     // 새 서비스워커가 제어를 넘겨받으면(=코드 갱신) 자동으로 한 번만 새로고침.
+    // ‼ 예전엔 무조건 새로고침해서, 앱을 열고 ▶ 를 누른 직후 새 버전이 깔리면 음악이 끊겼다.
+    //   · 처음 설치(이전 SW 없음)면 새로고침할 이유가 없다.
+    //   · 재생 중이면 미뤘다가, 앱이 화면에서 내려가 있고 멈춰 있을 때 조용히 새로고침한다.
     let swReloaded = false;
+    const hadController = !!navigator.serviceWorker.controller;
+    const reloadIfIdle = () => {
+      if (swReloaded || !audio.paused) return false;
+      swReloaded = true; saveResume(true); location.reload(); return true;
+    };
     navigator.serviceWorker.addEventListener("controllerchange", () => {
-      if (swReloaded) return; swReloaded = true; location.reload();
+      if (!hadController || swReloaded) return;
+      if (audio.paused && !audio.src) { reloadIfIdle(); return; }   // 아직 아무것도 안 듣는 중
+      toast("새 버전이 준비됐습니다 — 음악을 멈추고 앱을 나가면 적용됩니다.");
+      document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") reloadIfIdle(); });
+      audio.addEventListener("pause", () => { if (document.visibilityState === "hidden") reloadIfIdle(); });
     });
   }
   // 터치 순간 재발급(capture — 다른 처리보다 먼저). 만료됐거나 10분 안에 만료되면.

@@ -83,7 +83,7 @@ img{display:block}
 .track-title{font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .track.playing .track-title{color:var(--accent-dark)}
 .track-artist{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.track-add{width:34px;height:34px;flex:none;color:var(--faint);font-size:20px}
+.track-add{width:44px;height:44px;flex:none;color:var(--faint);font-size:20px}
 
 /* 앨범 그리드 보기 */
 .album-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;padding:6px 10px 150px}
@@ -131,11 +131,11 @@ img{display:block}
 .pld-track .track-body{flex:1;min-width:0}
 .pld-track .track-title{font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pld-track .track-artist{font-size:12.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.pld-grip{flex:none;width:30px;text-align:center;color:var(--faint);font-size:17px;cursor:grab;
+.pld-grip{flex:none;width:40px;text-align:center;color:var(--faint);font-size:17px;cursor:grab;
   touch-action:none;user-select:none;-webkit-user-select:none;letter-spacing:1px}
 .pld-track.dragging{transition:none;position:relative;z-index:5;cursor:grabbing;border-bottom-color:transparent;
   border-radius:12px;box-shadow:0 8px 24px rgba(30,20,10,.28)}
-.pld-remove{width:34px;height:34px;flex:none;color:var(--faint);font-size:20px}
+.pld-remove{width:44px;height:44px;flex:none;color:var(--faint);font-size:20px}
 /* 곡 추가 피커(전체화면) */
 .picker{z-index:70;background:var(--bg)}
 .track-add.added{color:var(--accent)}
@@ -162,7 +162,7 @@ img{display:block}
 .sheet-act{width:100%;text-align:left;padding:14px;border-radius:12px;background:var(--accent-soft);
   color:var(--accent-dark);font-weight:700;font-size:15px;margin-bottom:8px}
 .sheet-sep{font-size:12px;color:var(--muted);font-weight:600;margin:6px 2px 8px}
-.upnext-rm{width:32px;height:32px;flex:none;color:var(--faint);font-size:19px;background:transparent}
+.upnext-rm{width:44px;height:44px;flex:none;color:var(--faint);font-size:19px;background:transparent}
 /* 플레이어의 '다음 곡 N' 칩 */
 .upnext-chip{align-self:center;margin-top:2px;padding:6px 14px;border-radius:999px;
   background:var(--panel);border:1px solid var(--line);color:var(--muted);font-size:12.5px;font-weight:600}
@@ -177,7 +177,7 @@ img{display:block}
 .mini-meta{flex:1;min-width:0}
 .mini-title{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .mini-artist{font-size:12px;color:var(--dark-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.mini-btn{width:38px;height:38px;font-size:17px;color:var(--dark-ink);flex:none}
+.mini-btn{width:44px;height:44px;font-size:17px;color:var(--dark-ink);flex:none}
 .mini-prog{position:absolute;left:0;bottom:0;height:3px;width:100%;background:rgba(255,255,255,.12)}
 .mini-prog span{display:block;height:100%;width:0;background:var(--accent)}
 
@@ -348,3 +348,6 @@ img{display:block}
 .set-log{margin-top:10px;font-size:12px;color:var(--muted);line-height:1.7;max-height:150px;overflow:auto}
 .set-log .bad{color:#b9561f}
 #set-probe:not(:empty){margin-top:10px;padding:6px 10px;border-radius:var(--radius-sm);background:var(--bg)}
+
+/* 키보드·스위치 접근 시 어디에 있는지 보이게 */
+button:focus-visible,.track:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
